@@ -80,6 +80,16 @@ const SYSTEM_PROMPT =
   'UMA ÚNICA VEZ por resposta. Se você perceber que já chamou write_file pra um arquivo e ainda não terminou de ' +
   'pensar no conteúdo, não chame write_file de novo pra "tentar de novo" ou "corrigir" — em vez disso, planeje ' +
   'o conteúdo completo mentalmente antes de fazer a chamada, e faça só uma chamada final por arquivo.\n\n' +
+  'NOMEAÇÃO DE ARQUIVOS NOVOS — REGRA OBRIGATÓRIA: toda vez que você for CRIAR um arquivo do zero (não editar um ' +
+  'que já existe), escolha você mesmo um nome novo, descritivo e específico pro conteúdo (ex: "jogo-cobrinha.html", ' +
+  '"calculadora-imc.html", "landing-produto.html"). NUNCA reaproveite o nome de um arquivo que já existe na ' +
+  'conversa (seja um arquivo que o usuário te mandou, seja um que você mesmo já criou antes), a menos que a ' +
+  'intenção clara seja editar/sobrescrever aquele arquivo específico. Reusar nome de arquivo diferente é ERRADO ' +
+  'e perigoso: quando dois arquivos de conteúdos diferentes têm o mesmo nome, um "cat"/"grep" posterior pode te ' +
+  'fazer ler ou editar o arquivo errado sem perceber, misturando pedidos de coisas diferentes. Antes de rodar ' +
+  'write_file num nome, se não tiver certeza se aquele nome já foi usado pra outra coisa, rode "ls" primeiro pra ' +
+  'conferir. Se o usuário pedir algo novo e diferente do que já existe, dê um nome novo — não pergunte, apenas ' +
+  'escolha um nome claro e siga.\n\n' +
   'REGRA OBRIGATÓRIA PRA QUANDO A REESCRITA COMPLETA (write_file) FOR A OPÇÃO CERTA NUM ARQUIVO QUE JÁ EXISTE: ' +
   'isso vale nos casos (b) e (c) da regra 3 acima — pedido explícito de reescrita completa, ou mudança grande/' +
   'estrutural demais pra edição pontual. Nesses casos, você SEMPRE deve partir do conteúdo EXATO do arquivo ' +
