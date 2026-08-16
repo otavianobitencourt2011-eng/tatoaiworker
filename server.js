@@ -14,10 +14,19 @@ import express from 'express';
 const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
 const MODEL = 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning';
 
-const FETCH_TIMEOUT_MS = 240000;
+// Rodando no Render (sem limite de CPU time por request), dá pra usar
+// um timeout bem mais folgado do que dava no Cloudflare Free.
+const FETCH_TIMEOUT_MS = 300000;
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
-const MAX_TOKENS = 32768;
+// Esse modelo usa "reasoning_budget" pra limitar só a fase de
+// raciocínio (<think>), separado do max_tokens total. Sem isso, o
+// pensamento podia consumir a maior parte do budget de 32768 e sobrar
+// pouco espaço pra escrever um arquivo grande (jogo completo) — o que
+// explica respostas pequenas/incompletas em pedidos maiores. Valores
+// abaixo seguem o exemplo oficial da NVIDIA pra esse modelo.
+const MAX_TOKENS = 65536;
+const REASONING_BUDGET = 16384;
 
 const SYSTEM_PROMPT =
   'Você é o Tato, um assistente de IA amigável, direto e prestativo do app Tato IA. ' +
@@ -54,7 +63,11 @@ const SYSTEM_PROMPT =
   '4. A ferramenta edit_file (old_str/new_str) também está disponível como alternativa a sed -i, mas run_command ' +
   'é a via preferida — é o formato em que você foi mais treinado a operar.\n' +
   'Antes de decidir qual ferramenta usar, pense rapidamente: "isso é uma mudança pontual em algo que já existe, ' +
-  'ou é a criação de algo novo do zero?" Mudança pontual = run_command/sed -i. Criação nova = write_file.';
+  'ou é a criação de algo novo do zero?" Mudança pontual = run_command/sed -i. Criação nova = write_file.\n\n' +
+  'Você tem um orçamento de tokens grande disponível para a resposta. Nunca entregue uma versão resumida, ' +
+  'simplificada ou incompleta de um jogo/app por achar que está "economizando espaço" — isso é sempre errado. ' +
+  'Se o pedido envolve código (jogo, app, site), sua resposta final DEVE ser uma chamada de write_file com o ' +
+  'arquivo completo, nunca texto corrido com trechos de código, não importa o tamanho do arquivo.';
 
 function trimToSafeBoundary(text) {
   const windowStart = Math.max(0, text.length - 800);
@@ -183,6 +196,7 @@ app.post('/', async function (req, res) {
     messages: [{ role: 'system', content: SYSTEM_PROMPT }].concat(history),
     temperature: 0.7,
     max_tokens: MAX_TOKENS,
+    reasoning_budget: REASONING_BUDGET,
     stream: true
   };
   if (tools && tools.length) {
