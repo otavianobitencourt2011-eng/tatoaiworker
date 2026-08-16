@@ -63,20 +63,26 @@ const SYSTEM_PROMPT =
   '2. Se não tiver certeza do texto exato a trocar, rode primeiro "grep -n \'palavra-chave\' arquivo" ou "cat ' +
   'arquivo" via run_command pra ver o conteúdo real antes de editar. NUNCA adivinhe o conteúdo de um arquivo ' +
   'que já existe.\n' +
-  '3. write_file (reescrever o arquivo inteiro) só é aceitável na criação inicial de um arquivo novo, ou quando ' +
-  'o usuário pedir explicitamente uma reescrita completa. Fora isso, reescrever o arquivo inteiro pra uma ' +
-  'mudança pequena é ERRADO, desperdiça tokens e tem mais risco de introduzir bugs.\n' +
+  '3. write_file (reescrever o arquivo inteiro) é aceitável em três casos: (a) criação inicial de um arquivo ' +
+  'novo; (b) o usuário pedir explicitamente uma reescrita completa; ou (c) o pedido do usuário, mesmo sem pedir ' +
+  'reescrita completa, exigir uma mudança estrutural/complexa demais pra um sed -i ou edit_file pontual (ex: ' +
+  'adicionar uma feature nova que mexe em várias partes do arquivo, refatorar uma função inteira, mudar a lógica ' +
+  'de várias seções relacionadas). Nesse caso (c), write_file é a ferramenta CERTA, não errada — o que é proibido ' +
+  'não é reescrever o arquivo inteiro, e sim reescrevê-lo DIFERENTE do original. Ou seja: pra mudança pequena e ' +
+  'isolada, use sed -i/edit_file; pra mudança grande/estrutural, pode e deve usar write_file, desde que siga a ' +
+  'REGRA OBRIGATÓRIA abaixo (partir do conteúdo exato do arquivo antigo, mudar só o que foi pedido).\n' +
   '4. A ferramenta edit_file (old_str/new_str) também está disponível como alternativa a sed -i, mas run_command ' +
   'é a via preferida — é o formato em que você foi mais treinado a operar.\n' +
   'Antes de decidir qual ferramenta usar, pense rapidamente: "isso é uma mudança pontual em algo que já existe, ' +
   'ou é a criação de algo novo do zero?" Mudança pontual = run_command/sed -i. Criação nova = write_file.\n\n' +
   'REGRA OBRIGATÓRIA PRA QUANDO A REESCRITA COMPLETA (write_file) FOR A OPÇÃO CERTA NUM ARQUIVO QUE JÁ EXISTE: ' +
-  'isso só deve acontecer quando o usuário pediu explicitamente uma reescrita completa, ou quando a mudança é ' +
-  'estrutural demais pra um sed -i/edit_file pontual. Nesses casos, você SEMPRE deve partir do conteúdo EXATO ' +
-  'do arquivo antigo (visto via cat/grep recente nesta janela de contexto) e reescrevê-lo aplicando SOMENTE as ' +
-  'melhorias/mudanças que o usuário pediu. Nunca gere uma versão nova "do seu jeito", reorganizada, reescrita ' +
-  'com outra estrutura, outros nomes de variável/função, outro estilo de código, comentários removidos/reescritos, ' +
-  'ou qualquer trecho reformulado que o usuário não pediu pra mexer. Todo o resto do arquivo (código, comentários, ' +
+  'isso vale nos casos (b) e (c) da regra 3 acima — pedido explícito de reescrita completa, ou mudança grande/' +
+  'estrutural demais pra edição pontual. Nesses casos, você SEMPRE deve partir do conteúdo EXATO do arquivo ' +
+  'antigo (visto via cat/grep recente nesta janela de contexto) e reescrevê-lo aplicando SOMENTE as melhorias/ ' +
+  'mudanças que o usuário pediu. O que é proibido não é usar write_file — é usar write_file pra gerar um arquivo ' +
+  'PARALELO/DIFERENTE do original. Nunca gere uma versão nova "do seu jeito", reorganizada, reescrita com outra ' +
+  'estrutura, outros nomes de variável/função, outro estilo de código, comentários removidos/reescritos, ou ' +
+  'qualquer trecho reformulado que o usuário não pediu pra mexer. Todo o resto do arquivo (código, comentários, ' +
   'formatação, ordem, nomes) deve permanecer IDÊNTICO ao original — igual a um diff limpo, onde só as linhas ' +
   'relacionadas ao pedido do usuário mudam. Se em algum momento você notar que está "recriando" o arquivo de ' +
   'memória ou do seu próprio estilo em vez de copiar o conteúdo real visto no cat/grep, pare e rode "cat" no ' +
@@ -92,8 +98,16 @@ const SYSTEM_PROMPT =
   'recente, ISSO NÃO SIGNIFICA que o arquivo não existe ou está vazio — significa apenas que você não viu o ' +
   'conteúdo dele ainda. Nunca conclua "não tenho esse arquivo no histórico, então vou criar do zero". Rode ' +
   '"ls" pra confirmar se o arquivo existe e "cat"/"grep" pra ver o conteúdo real ANTES de qualquer write_file ' +
-  'ou edição. Só use write_file num arquivo que já existe se o usuário pedir explicitamente uma reescrita ' +
-  'completa — nunca por falta de memória da conversa.';
+  'ou edição. Reescrever completamente (write_file) um arquivo que já existe é permitido nos casos (b) e (c) ' +
+  'da regra 3 — não é restrito só a pedido explícito de reescrita total.\n\n' +
+  'ATENÇÃO — QUAL É A VERSÃO "ATUAL" DO ARQUIVO: se você mesmo editou um arquivo mais cedo nesta conversa (via ' +
+  'write_file, sed -i ou edit_file), e o usuário em seguida pede pra ajustar/corrigir mais alguma coisa nesse ' +
+  'mesmo arquivo, o ponto de partida é SEMPRE o estado do arquivo DEPOIS da sua última edição — nunca a versão ' +
+  'de antes (seja a que o usuário mandou originalmente, seja uma versão intermediária). Não presuma de memória ' +
+  'qual é o conteúdo atual mesmo que você mesmo tenha acabado de escrevê-lo: antes de aplicar a próxima mudança, ' +
+  'rode "cat"/"grep" no arquivo de novo pra confirmar o estado real em disco (sua última escrita pode ter sido ' +
+  'diferente do que você "lembra" ter escrito). Trate cada pedido novo de alteração como incidindo sobre o ' +
+  'resultado da edição anterior, em cadeia — nunca volte a trabalhar em cima da versão original/pré-edição.';
 
 function trimToSafeBoundary(text) {
   const windowStart = Math.max(0, text.length - 800);
