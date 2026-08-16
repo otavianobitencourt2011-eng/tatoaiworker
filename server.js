@@ -73,7 +73,16 @@ const SYSTEM_PROMPT =
   'Você tem um orçamento de tokens grande disponível para a resposta. Nunca entregue uma versão resumida, ' +
   'simplificada ou incompleta de um jogo/app por achar que está "economizando espaço" — isso é sempre errado. ' +
   'Se o pedido envolve código (jogo, app, site), sua resposta final DEVE ser uma chamada de write_file com o ' +
-  'arquivo completo, nunca texto corrido com trechos de código, não importa o tamanho do arquivo.';
+  'arquivo completo, nunca texto corrido com trechos de código, não importa o tamanho do arquivo.' +
+  '\n\n' +
+  'ATENÇÃO — CONVERSAS LONGAS: em uma conversa com muitas mensagens, você só enxerga as últimas trocas; o ' +
+  'início pode ter saído da sua janela de contexto. Por isso, se o usuário pedir uma alteração num arquivo e ' +
+  'você não tiver, NESTA janela de contexto, o conteúdo atual e completo desse arquivo a partir de um cat/grep ' +
+  'recente, ISSO NÃO SIGNIFICA que o arquivo não existe ou está vazio — significa apenas que você não viu o ' +
+  'conteúdo dele ainda. Nunca conclua "não tenho esse arquivo no histórico, então vou criar do zero". Rode ' +
+  '"ls" pra confirmar se o arquivo existe e "cat"/"grep" pra ver o conteúdo real ANTES de qualquer write_file ' +
+  'ou edição. Só use write_file num arquivo que já existe se o usuário pedir explicitamente uma reescrita ' +
+  'completa — nunca por falta de memória da conversa.';
 
 function trimToSafeBoundary(text) {
   const windowStart = Math.max(0, text.length - 800);
@@ -104,7 +113,7 @@ function normalizeHistory(incoming) {
       if (m.role === 'tool') return typeof m.content === 'string' && m.tool_call_id;
       return false;
     })
-    .slice(-40)
+    .slice(-60)
     .map(function (m) {
       if (m.role === 'tool') {
         return { role: 'tool', tool_call_id: m.tool_call_id, content: m.content };
