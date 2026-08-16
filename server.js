@@ -139,6 +139,27 @@ const SYSTEM_PROMPT =
   'diferente do que você "lembra" ter escrito). Trate cada pedido novo de alteração como incidindo sobre o ' +
   'resultado da edição anterior, em cadeia — nunca volte a trabalhar em cima da versão original/pré-edição.';
 
+// Esse lembrete é reenviado no FINAL da lista de mensagens em TODA
+// requisição (depois de todo o histórico da conversa), não só uma vez lá
+// no system prompt do início. Motivo: em conversas longas, o system prompt
+// original fica "distante" (antes de dezenas de mensagens) no momento em
+// que o modelo decide o próximo passo, e regras específicas enterradas nele
+// acabam sendo ignoradas na prática. Repetir a regra crítica bem coladinha
+// no ponto onde o modelo vai gerar a próxima ação aumenta MUITO a chance
+// dele realmente seguir — é a mesma técnica de "sanduíche" de instruções.
+const FILE_REMINDER =
+  'LEMBRETE CRÍTICO SOBRE ARQUIVOS (siga isso agora, não só o que estava no system prompt lá no início): ' +
+  '(1) Antes de mexer em QUALQUER arquivo que já existe — seja pra editar pontualmente ou reescrever inteiro — ' +
+  'rode "ls" e depois "cat"/"grep" pra confirmar o nome exato e o conteúdo REAL do arquivo AGORA, mesmo que você ' +
+  'ache que já sabe (sua "lembrança" pode estar desatualizada ou ser de um arquivo diferente com nome parecido). ' +
+  'Nunca edite ou analise um arquivo baseado só no que apareceu antes na conversa sem reconferir. ' +
+  '(2) Se a ação certa for reescrever um arquivo já existente por completo (write_file), o nome do arquivo NOVO ' +
+  'tem que ser diferente do nome atual: adicione um número antes da extensão, incrementando a partir do que já ' +
+  'existir (ex: "jogo.html" existente → escreva "jogo1.html"; se já existir "jogo1.html" → escreva "jogo2.html"). ' +
+  'NUNCA escreva um write_file usando exatamente o mesmo nome que um arquivo que já existe na conversa. ' +
+  '(3) Se a ação for só um ajuste pontual (sed -i/edit_file) no arquivo, aí sim o nome continua o mesmo — não ' +
+  'numera edição pontual, só reescrita completa.';
+
 function trimToSafeBoundary(text) {
   const windowStart = Math.max(0, text.length - 800);
   const tail = text.slice(windowStart);
@@ -267,7 +288,7 @@ app.post('/', async function (req, res) {
 
   const payload = {
     model: MODEL,
-    messages: [{ role: 'system', content: SYSTEM_PROMPT }].concat(history),
+    messages: [{ role: 'system', content: SYSTEM_PROMPT }].concat(history).concat([{ role: 'system', content: FILE_REMINDER }]),
     temperature: 0.7,
     top_p: 0.95,
     max_tokens: MAX_TOKENS,
