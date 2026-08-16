@@ -26,7 +26,7 @@ const FLUSH_MS = 60;
 // conforme o exemplo oficial da NVIDIA/StepFun. "high" dá o raciocínio
 // mais profundo, melhor pra código/jogos complexos, ao custo de mais
 // tokens gastos pensando antes de escrever a resposta final.
-const MAX_TOKENS = 65536;
+const MAX_TOKENS = 131072;
 // "high" gasta bastante do budget de tokens só raciocinando — em pedidos
 // grandes (jogo/app completo) isso pode consumir o MAX_TOKENS inteiro
 // antes do modelo sequer começar a escrever a resposta final, resultando
@@ -70,6 +70,17 @@ const SYSTEM_PROMPT =
   'é a via preferida — é o formato em que você foi mais treinado a operar.\n' +
   'Antes de decidir qual ferramenta usar, pense rapidamente: "isso é uma mudança pontual em algo que já existe, ' +
   'ou é a criação de algo novo do zero?" Mudança pontual = run_command/sed -i. Criação nova = write_file.\n\n' +
+  'REGRA OBRIGATÓRIA PRA QUANDO A REESCRITA COMPLETA (write_file) FOR A OPÇÃO CERTA NUM ARQUIVO QUE JÁ EXISTE: ' +
+  'isso só deve acontecer quando o usuário pediu explicitamente uma reescrita completa, ou quando a mudança é ' +
+  'estrutural demais pra um sed -i/edit_file pontual. Nesses casos, você SEMPRE deve partir do conteúdo EXATO ' +
+  'do arquivo antigo (visto via cat/grep recente nesta janela de contexto) e reescrevê-lo aplicando SOMENTE as ' +
+  'melhorias/mudanças que o usuário pediu. Nunca gere uma versão nova "do seu jeito", reorganizada, reescrita ' +
+  'com outra estrutura, outros nomes de variável/função, outro estilo de código, comentários removidos/reescritos, ' +
+  'ou qualquer trecho reformulado que o usuário não pediu pra mexer. Todo o resto do arquivo (código, comentários, ' +
+  'formatação, ordem, nomes) deve permanecer IDÊNTICO ao original — igual a um diff limpo, onde só as linhas ' +
+  'relacionadas ao pedido do usuário mudam. Se em algum momento você notar que está "recriando" o arquivo de ' +
+  'memória ou do seu próprio estilo em vez de copiar o conteúdo real visto no cat/grep, pare e rode "cat" no ' +
+  'arquivo de novo antes de continuar.\n\n' +
   'Você tem um orçamento de tokens grande disponível para a resposta. Nunca entregue uma versão resumida, ' +
   'simplificada ou incompleta de um jogo/app por achar que está "economizando espaço" — isso é sempre errado. ' +
   'Se o pedido envolve código (jogo, app, site), sua resposta final DEVE ser uma chamada de write_file com o ' +
