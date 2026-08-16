@@ -75,6 +75,11 @@ const SYSTEM_PROMPT =
   'é a via preferida — é o formato em que você foi mais treinado a operar.\n' +
   'Antes de decidir qual ferramenta usar, pense rapidamente: "isso é uma mudança pontual em algo que já existe, ' +
   'ou é a criação de algo novo do zero?" Mudança pontual = run_command/sed -i. Criação nova = write_file.\n\n' +
+  'NUNCA repita a mesma chamada de ferramenta (write_file, run_command, edit_file) mais de uma vez seguida com ' +
+  'o mesmo arquivo e o mesmo conteúdo/comando dentro da mesma resposta. Cada arquivo deve ser escrito ou editado ' +
+  'UMA ÚNICA VEZ por resposta. Se você perceber que já chamou write_file pra um arquivo e ainda não terminou de ' +
+  'pensar no conteúdo, não chame write_file de novo pra "tentar de novo" ou "corrigir" — em vez disso, planeje ' +
+  'o conteúdo completo mentalmente antes de fazer a chamada, e faça só uma chamada final por arquivo.\n\n' +
   'REGRA OBRIGATÓRIA PRA QUANDO A REESCRITA COMPLETA (write_file) FOR A OPÇÃO CERTA NUM ARQUIVO QUE JÁ EXISTE: ' +
   'isso vale nos casos (b) e (c) da regra 3 acima — pedido explícito de reescrita completa, ou mudança grande/' +
   'estrutural demais pra edição pontual. Nesses casos, você SEMPRE deve partir do conteúdo EXATO do arquivo ' +
@@ -411,7 +416,28 @@ app.post('/', async function (req, res) {
     return;
   }
 
-  const cleanToolCalls = toolCallsAcc.filter(Boolean);
+  // Às vezes o modelo "engasga" e repete a mesma tool_call (ex: write_file
+  // do mesmo arquivo com o mesmo conteúdo) 2, 3, 4 vezes seguidas dentro da
+  // mesma resposta — um comportamento de repetição comum em LLMs, principal-
+  // mente em respostas longas. Isso não corrompe o arquivo (é sempre o mesmo
+  // conteúdo sendo escrito de novo por cima), mas é chato pro usuário ver
+  // "N arquivos" idênticos aparecendo. Deduplica por (nome da função +
+  // argumentos exatos), mantendo a primeira ocorrência — se alguma vier com
+  // argumentos genuinamente diferentes (outro arquivo, outro conteúdo), ela
+  // continua passando normalmente.
+  function dedupeToolCalls(calls) {
+    const seen = new Set();
+    const out = [];
+    for (const tc of calls) {
+      const key = (tc.function && tc.function.name || '') + '\u0000' + (tc.function && tc.function.arguments || '');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(tc);
+    }
+    return out;
+  }
+
+  const cleanToolCalls = dedupeToolCalls(toolCallsAcc.filter(Boolean));
   if (cleanToolCalls.length) {
     send({
       type: 'done',
