@@ -300,29 +300,69 @@ app.post('/', async function (req, res) {
     payload.tool_choice = 'auto';
   }
 
+  // Retry com backoff exponencial pra erros 429 (rate limit) e 503/502
+  // (sobrecarga momentânea do provedor). Tenta a chamada até MAX_RETRIES
+  // vezes, respeitando o header "Retry-After" da API se ele vier, ou usando
+  // backoff exponencial (1s, 2s, 4s) com um pouco de jitter caso não venha.
+  // Só depois de esgotar as tentativas é que devolve erro pro usuário — e
+  // nesse caso a mensagem é sempre genérica, sem expor o código/detalhe
+  // técnico da API (rate limit é informação interna, não interessa ao
+  // usuário final e pode até dar pista de limites pra abusar).
+  const MAX_RETRIES = 3;
+  const RETRYABLE_STATUS = new Set([429, 502, 503]);
+
+  function sleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
   let upstream;
+  let lastErrStatus = null;
+  let lastErrText = '';
   try {
-    upstream = await fetch(NVIDIA_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + NVIDIA_API_KEY,
-        'Accept': 'text/event-stream'
-      },
-      body: JSON.stringify(payload)
-    });
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      upstream = await fetch(NVIDIA_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + NVIDIA_API_KEY,
+          'Accept': 'text/event-stream'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (upstream.ok && upstream.body) break;
+
+      lastErrStatus = upstream.status;
+      const isRetryable = RETRYABLE_STATUS.has(upstream.status);
+      const isLastAttempt = attempt === MAX_RETRIES;
+
+      if (!isRetryable || isLastAttempt) {
+        lastErrText = await upstream.text().catch(function () { return ''; });
+        break;
+      }
+
+      // Descarta o corpo da resposta antes de tentar de novo, pra não
+      // vazar a conexão.
+      await upstream.text().catch(function () { return ''; });
+
+      const retryAfterHeader = upstream.headers.get('retry-after');
+      const retryAfterMs = retryAfterHeader ? (parseFloat(retryAfterHeader) * 1000) : null;
+      const backoffMs = retryAfterMs && !isNaN(retryAfterMs)
+        ? retryAfterMs
+        : (1000 * Math.pow(2, attempt)) + Math.floor(Math.random() * 300);
+
+      await sleep(backoffMs);
+    }
   } catch (err) {
-    return res.status(502).json({ ok: false, error: 'Falha de rede ao chamar a IA: ' + (err && err.message || err) });
+    return res.status(502).json({ ok: false, error: 'Server sobrecarregado, tente novamente mais tarde.' });
   }
 
   if (!upstream.ok || !upstream.body) {
-    const rawText = await upstream.text().catch(function () { return ''; });
-    let errMsg = rawText ? rawText.slice(0, 300) : ('Erro na API da IA (' + upstream.status + ')');
-    try {
-      const d = JSON.parse(rawText);
-      errMsg = (d.error && (d.error.message || d.error)) || errMsg;
-    } catch (e) { /* rawText não era JSON */ }
-    return res.status(502).json({ ok: false, error: 'Erro na API da IA (' + upstream.status + '): ' + errMsg });
+    // Mensagem sempre genérica pro usuário, independente do status real
+    // (429, 502, 503, etc) — não expõe detalhe técnico/interno da API.
+    // O status/texto real fica só no log do servidor, pra debug.
+    console.error('Erro upstream da IA após retries — status:', lastErrStatus, 'body:', (lastErrText || '').slice(0, 300));
+    return res.status(502).json({ ok: false, error: 'Server sobrecarregado, tente novamente mais tarde.' });
   }
 
   res.writeHead(200, {
