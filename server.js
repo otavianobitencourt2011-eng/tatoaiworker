@@ -12,20 +12,22 @@
 import express from 'express';
 
 const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
-const MODEL = 'qwen3.8-2.4T-A95B';
+const MODEL = 'stepfun-ai/step-3.7-flash';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
 const FETCH_TIMEOUT_MS = 300000;
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
-// Esse modelo usa "reasoning_budget" pra limitar só a fase de
-// raciocínio (<think>), separado do max_tokens total. Sem isso, o
-// pensamento podia consumir a maior parte do budget de 32768 e sobrar
-// pouco espaço pra escrever um arquivo grande (jogo completo) — o que
-// explica respostas pequenas/incompletas em pedidos maiores. Valores
-// abaixo seguem o exemplo oficial da NVIDIA pra esse modelo.
-const MAX_TOKENS = 8064;
+// Step 3.7 Flash (StepFun) é MoE: 198B parâmetros totais, ~11B ativos
+// por token, contexto de 256K. Diferente do Nemotron, esse modelo NÃO
+// usa "reasoning_budget" — o controle de raciocínio é feito via
+// "reasoning_effort" (low/medium/high) dentro de "chat_template_kwargs",
+// conforme o exemplo oficial da NVIDIA/StepFun. "high" dá o raciocínio
+// mais profundo, melhor pra código/jogos complexos, ao custo de mais
+// tokens gastos pensando antes de escrever a resposta final.
+const MAX_TOKENS = 65536;
+const REASONING_EFFORT = 'high';
 
 const SYSTEM_PROMPT =
   'Você é o Tato, um assistente de IA amigável, direto e prestativo do app Tato IA. ' +
@@ -194,7 +196,9 @@ app.post('/', async function (req, res) {
     model: MODEL,
     messages: [{ role: 'system', content: SYSTEM_PROMPT }].concat(history),
     temperature: 0.7,
+    top_p: 0.95,
     max_tokens: MAX_TOKENS,
+    chat_template_kwargs: { reasoning_effort: REASONING_EFFORT },
     stream: true
   };
   if (tools && tools.length) {
