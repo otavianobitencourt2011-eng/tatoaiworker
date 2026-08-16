@@ -12,7 +12,7 @@
 import express from 'express';
 
 const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
-const MODEL = 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning';
+const MODEL = 'deepseek-ai/deepseek-v4-flash';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -25,8 +25,7 @@ const FLUSH_MS = 60;
 // pouco espaço pra escrever um arquivo grande (jogo completo) — o que
 // explica respostas pequenas/incompletas em pedidos maiores. Valores
 // abaixo seguem o exemplo oficial da NVIDIA pra esse modelo.
-const MAX_TOKENS = 65536;
-const REASONING_BUDGET = 16384;
+const MAX_TOKENS = 8064;
 
 const SYSTEM_PROMPT =
   'Você é o Tato, um assistente de IA amigável, direto e prestativo do app Tato IA. ' +
@@ -196,7 +195,6 @@ app.post('/', async function (req, res) {
     messages: [{ role: 'system', content: SYSTEM_PROMPT }].concat(history),
     temperature: 0.7,
     max_tokens: MAX_TOKENS,
-    reasoning_budget: REASONING_BUDGET,
     stream: true
   };
   if (tools && tools.length) {
