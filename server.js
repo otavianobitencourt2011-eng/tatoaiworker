@@ -27,7 +27,12 @@ const FLUSH_MS = 60;
 // mais profundo, melhor pra código/jogos complexos, ao custo de mais
 // tokens gastos pensando antes de escrever a resposta final.
 const MAX_TOKENS = 65536;
-const REASONING_EFFORT = 'high';
+// "high" gasta bastante do budget de tokens só raciocinando — em pedidos
+// grandes (jogo/app completo) isso pode consumir o MAX_TOKENS inteiro
+// antes do modelo sequer começar a escrever a resposta final, resultando
+// em resposta vazia/truncada. "medium" dá um raciocínio bom mantendo mais
+// espaço livre pra escrever o arquivo de verdade.
+const REASONING_EFFORT = 'medium';
 
 const SYSTEM_PROMPT =
   'Você é o Tato, um assistente de IA amigável, direto e prestativo do app Tato IA. ' +
@@ -152,10 +157,14 @@ function makeThinkFilter() {
   }
 
   function flushRemainder() {
-    let visible = '';
-    if (!inThink && buffer) visible = buffer;
+    // Se o stream acabou (ex: bateu max_tokens) e ainda tava "dentro" de um
+    // <think> nunca fechado, ANTES esse texto era simplesmente descartado
+    // (bug). Agora ele é devolvido como texto visível — melhor entregar
+    // algo pro usuário do que sumir com a resposta inteira.
+    const leftover = buffer;
     buffer = '';
-    return { visible: visible, thinking: '' };
+    inThink = false;
+    return { visible: leftover, thinking: '' };
   }
 
   return { feed: feed, flushRemainder: flushRemainder };
@@ -313,6 +322,15 @@ app.post('/', async function (req, res) {
         if (!choice) continue;
         const delta = choice.delta || {};
 
+        // Step 3.7 Flash (e outros modelos com --reasoning-parser no vLLM)
+        // mandam o raciocínio num campo separado "reasoning_content", em
+        // vez de tags <think> dentro de "content". Captura os dois formatos
+        // pra funcionar com qualquer um dos dois estilos de modelo.
+        if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+          pendingThinking += delta.reasoning_content;
+          scheduleFlush();
+        }
+
         if (typeof delta.content === 'string' && delta.content) {
           const parts = think.feed(delta.content);
           if (parts.thinking) {
@@ -372,7 +390,10 @@ app.post('/', async function (req, res) {
 
   let reply = contentAcc.trim();
   if (!reply) {
-    send({ type: 'error', error: 'A IA não retornou uma resposta.' });
+    const reason = finishReason === 'length'
+      ? 'A IA gastou todo o limite de tokens pensando e não sobrou espaço pra escrever a resposta. Tente pedir algo mais simples/dividido em partes, ou baixe o nível de reasoning.'
+      : 'A IA não retornou uma resposta.';
+    send({ type: 'error', error: reason });
     finish();
     return;
   }
