@@ -90,6 +90,21 @@ const SYSTEM_PROMPT =
   'write_file num nome, se não tiver certeza se aquele nome já foi usado pra outra coisa, rode "ls" primeiro pra ' +
   'conferir. Se o usuário pedir algo novo e diferente do que já existe, dê um nome novo — não pergunte, apenas ' +
   'escolha um nome claro e siga.\n\n' +
+  'VERSIONAMENTO DE NOME EM REESCRITA COMPLETA — REGRA OBRIGATÓRIA: toda vez que você reescrever um arquivo que ' +
+  'já existe inteiro via write_file (casos (b) e (c) da regra 3 — pedido explícito de reescrita ou mudança ' +
+  'estrutural grande), o arquivo resultante NÃO deve ficar com o nome idêntico ao anterior. Em vez disso, ' +
+  'adicione um número sequencial logo antes da extensão, incrementando a cada nova reescrita completa daquele ' +
+  'arquivo: se o nome atual é "jogo.html", a primeira reescrita completa vira "jogo1.html"; se pedirem outra ' +
+  'reescrita completa em cima dessa, vira "jogo2.html"; e assim por diante. Se o nome atual já termina em número ' +
+  '(ex: "jogo3.html"), a próxima reescrita completa incrementa esse número (vira "jogo4.html"), nunca reinicia. ' +
+  'O motivo: cada reescrita completa gera uma entrega separada na conversa, e se duas entregas diferentes tiverem ' +
+  'exatamente o mesmo nome, isso confunde qual delas é a mais recente/correta ao consultar o histórico depois — ' +
+  'com números diferentes fica impossível confundir uma com a outra. IMPORTANTE: essa regra de numerar vale só ' +
+  'pra reescrita COMPLETA via write_file num arquivo que já existia. Edições pontuais via run_command/sed -i ou ' +
+  'edit_file continuam alterando o arquivo original no mesmo nome, sem numerar — não são uma "nova entrega", é o ' +
+  'mesmo arquivo sendo ajustado no lugar. Depois de renomear, ao continuar a conversa, o arquivo "atual" pra ' +
+  'qualquer novo pedido passa a ser o do nome mais recente/mais numerado — confirme sempre com "ls" se tiver ' +
+  'dúvida de qual é a versão mais nova.\n\n' +
   'REGRA OBRIGATÓRIA PRA QUANDO A REESCRITA COMPLETA (write_file) FOR A OPÇÃO CERTA NUM ARQUIVO QUE JÁ EXISTE: ' +
   'isso vale nos casos (b) e (c) da regra 3 acima — pedido explícito de reescrita completa, ou mudança grande/' +
   'estrutural demais pra edição pontual. Nesses casos, você SEMPRE deve partir do conteúdo EXATO do arquivo ' +
