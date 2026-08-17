@@ -34,9 +34,26 @@ const MAX_TOKENS = 131072;
 // espaço livre pra escrever o arquivo de verdade.
 const REASONING_EFFORT = 'medium';
 
-const SYSTEM_PROMPT =
+// O idioma de resposta agora é dinâmico (vem do campo "lang" que o
+// frontend manda no body: "pt-BR" ou "en-US", conforme a escolha da
+// pessoa nas configurações do app). O resto do prompt (regras de
+// arquitetura, ferramentas etc.) continua em português porque são
+// instruções internas pro modelo, não texto que o usuário vê — isso
+// não afeta o idioma da resposta final.
+function languageDirective(lang) {
+  if (lang === 'en-US') {
+    return 'Always respond in English (en-US), in a natural, clear and direct way, no matter what language the ' +
+      'user writes in or what language earlier messages in this conversation were written in. This applies to ' +
+      'every reply from now on.';
+  }
+  return 'Responda sempre em português do Brasil, de forma natural, clara e sem enrolação, independentemente do ' +
+    'idioma usado pelo usuário ou de mensagens anteriores nesta conversa. Isso vale para toda resposta a partir de agora.';
+}
+
+function buildSystemPrompt(lang) {
+  return (
   'Você é o Tato, um assistente de IA amigável, direto e prestativo do app Tato IA. ' +
-  'Responda sempre em português do Brasil, de forma natural, clara e sem enrolação. ' +
+  languageDirective(lang) + ' ' +
   '\n\n' +
   'Quando o usuário pedir para criar algo que resulte em código (um jogo, uma página, um script, etc), ' +
   'NÃO escreva o código como texto na conversa. Em vez disso, use a ferramenta write_file (ou "cat > arquivo << ' +
@@ -137,7 +154,9 @@ const SYSTEM_PROMPT =
   'qual é o conteúdo atual mesmo que você mesmo tenha acabado de escrevê-lo: antes de aplicar a próxima mudança, ' +
   'rode "cat"/"grep" no arquivo de novo pra confirmar o estado real em disco (sua última escrita pode ter sido ' +
   'diferente do que você "lembra" ter escrito). Trate cada pedido novo de alteração como incidindo sobre o ' +
-  'resultado da edição anterior, em cadeia — nunca volte a trabalhar em cima da versão original/pré-edição.';
+  'resultado da edição anterior, em cadeia — nunca volte a trabalhar em cima da versão original/pré-edição.'
+  );
+}
 
 // Esse lembrete é reenviado no FINAL da lista de mensagens em TODA
 // requisição (depois de todo o histórico da conversa), não só uma vez lá
@@ -159,6 +178,17 @@ const FILE_REMINDER =
   'NUNCA escreva um write_file usando exatamente o mesmo nome que um arquivo que já existe na conversa. ' +
   '(3) Se a ação for só um ajuste pontual (sed -i/edit_file) no arquivo, aí sim o nome continua o mesmo — não ' +
   'numera edição pontual, só reescrita completa.';
+
+// Lembrete de idioma reenviado coladinho no final da lista de mensagens
+// (mesma técnica de "sanduíche" usada no FILE_REMINDER acima) — garante
+// que a instrução de idioma não fique "enterrada" lá no início do
+// system prompt em conversas longas.
+function buildLangReminder(lang) {
+  if (lang === 'en-US') {
+    return 'LANGUAGE REMINDER: reply in English (en-US) now, regardless of the language used earlier in this conversation.';
+  }
+  return 'LEMBRETE DE IDIOMA: responda agora em português do Brasil, independentemente do idioma usado antes nesta conversa.';
+}
 
 function trimToSafeBoundary(text) {
   const windowStart = Math.max(0, text.length - 800);
@@ -285,10 +315,13 @@ app.post('/', async function (req, res) {
   }
 
   const tools = Array.isArray(body && body.tools) ? body.tools : undefined;
+  const lang = (body && body.lang === 'en-US') ? 'en-US' : 'pt-BR';
 
   const payload = {
     model: MODEL,
-    messages: [{ role: 'system', content: SYSTEM_PROMPT }].concat(history).concat([{ role: 'system', content: FILE_REMINDER }]),
+    messages: [{ role: 'system', content: buildSystemPrompt(lang) }]
+      .concat(history)
+      .concat([{ role: 'system', content: FILE_REMINDER }, { role: 'system', content: buildLangReminder(lang) }]),
     temperature: 0.7,
     top_p: 0.95,
     max_tokens: MAX_TOKENS,
