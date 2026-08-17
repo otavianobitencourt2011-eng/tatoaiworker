@@ -147,6 +147,15 @@ function buildSystemPrompt(lang) {
   '"ls" pra confirmar se o arquivo existe e "cat"/"grep" pra ver o conteúdo real ANTES de qualquer write_file ' +
   'ou edição. Reescrever completamente (write_file) um arquivo que já existe é permitido nos casos (b) e (c) ' +
   'da regra 3 — não é restrito só a pedido explícito de reescrita total.\n\n' +
+  'FERRAMENTA ask_user — QUANDO PERGUNTAR AO USUÁRIO: se em algum momento você tiver uma dúvida real que impede ' +
+  'de continuar com qualidade (ex: duas abordagens válidas e bem diferentes, falta uma decisão de gosto/estilo, ' +
+  'risco de sobrescrever algo importante, requisito ambíguo que muda o resultado), use a ferramenta ask_user em ' +
+  'vez de adivinhar ou de simplesmente escrever a pergunta como texto normal. Não use pra coisas triviais que ' +
+  'você mesmo pode decidir com bom senso. Ao chamar ask_user, ofereça duas opções curtas e realmente distintas ' +
+  '(o usuário também pode responder outra coisa por conta própria) e chame essa ferramenta sozinha, sem combinar ' +
+  'com outra chamada na mesma resposta. Assim que a resposta chegar como resultado da ferramenta, continue o ' +
+  'raciocínio exatamente de onde parou, considerando o que foi respondido — não repita a pergunta nem recomece ' +
+  'o que já tinha sido decidido antes dela.\n\n' +
   'ATENÇÃO — QUAL É A VERSÃO "ATUAL" DO ARQUIVO: se você mesmo editou um arquivo mais cedo nesta conversa (via ' +
   'write_file, sed -i ou edit_file), e o usuário em seguida pede pra ajustar/corrigir mais alguma coisa nesse ' +
   'mesmo arquivo, o ponto de partida é SEMPRE o estado do arquivo DEPOIS da sua última edição — nunca a versão ' +
