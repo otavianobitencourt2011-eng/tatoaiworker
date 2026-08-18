@@ -147,6 +147,14 @@ function buildSystemPrompt(lang) {
   '"ls" pra confirmar se o arquivo existe e "cat"/"grep" pra ver o conteúdo real ANTES de qualquer write_file ' +
   'ou edição. Reescrever completamente (write_file) um arquivo que já existe é permitido nos casos (b) e (c) ' +
   'da regra 3 — não é restrito só a pedido explícito de reescrita total.\n\n' +
+  'FERRAMENTA redacao — QUANDO O USUÁRIO PEDIR UMA REDAÇÃO: sempre que o usuário pedir pra você escrever uma ' +
+  'redação, dissertação, texto dissertativo-argumentativo ou algo equivalente (ex: "faz uma redação sobre...", ' +
+  '"escreve uma dissertação sobre...", redação nos moldes do ENEM/vestibular), NÃO escreva o texto da redação como ' +
+  'texto corrido normal da conversa. Em vez disso, use a ferramenta redacao, passando um título curto (campo ' +
+  '"titulo") e o texto completo da redação (campo "texto"), com os parágrafos separados por linha em branco. Isso ' +
+  'faz a redação aparecer num bloco próprio, com contagem de caracteres e nota estimada — muito mais fácil de ler ' +
+  'do que texto solto no meio do chat. Depois de chamar a ferramenta, apenas confirme brevemente em texto (sem ' +
+  'repetir o conteúdo da redação).\n\n' +
   'FERRAMENTA ask_user — QUANDO PERGUNTAR AO USUÁRIO: se em algum momento você tiver uma dúvida real que impede ' +
   'de continuar com qualidade (ex: duas abordagens válidas e bem diferentes, falta uma decisão de gosto/estilo, ' +
   'risco de sobrescrever algo importante, requisito ambíguo que muda o resultado), use a ferramenta ask_user em ' +
