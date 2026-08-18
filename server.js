@@ -16,7 +16,7 @@ const MODEL = 'stepfun-ai/step-3.7-flash';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
-const FETCH_TIMEOUT_MS = 300000;
+const FETCH_TIMEOUT_MS = 1200000; // 20 minutos (era 5 min — cortava em respostas longas/reescritas grandes)
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
 // Step 3.7 Flash (StepFun) é MoE: 198B parâmetros totais, ~11B ativos
