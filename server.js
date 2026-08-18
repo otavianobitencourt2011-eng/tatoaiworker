@@ -199,6 +199,33 @@ function buildLangReminder(lang) {
   return 'LEMBRETE DE IDIOMA: responda agora em português do Brasil, independentemente do idioma usado antes nesta conversa.';
 }
 
+// Lembrete de DATA reenviado coladinho no final da lista de mensagens
+// (mesmo "sanduíche" do FILE_REMINDER e do buildLangReminder acima).
+// Antes, a única noção de data que o modelo tinha era o texto solto que
+// o front colava na última mensagem do usuário quando o modo Pesquisa
+// tava ligado — sem isso vindo do servidor, o modelo confiava na própria
+// "memória" de treino (~2024) pra interpretar resultado de busca, e
+// respondia como se ainda fosse 2024. Gerando a data aqui no servidor
+// (igual já era feito pro FILE_REMINDER), ela chega em toda requisição,
+// sempre atualizada, sem depender do front mandar certo.
+function buildDateReminder(lang) {
+  const now = new Date();
+  if (lang === 'en-US') {
+    const formatted = now.toLocaleDateString('en-US', {
+      timeZone: 'America/Sao_Paulo', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+    });
+    return 'DATE REMINDER: today is ' + formatted + '. Use this as the real current date for anything time-sensitive ' +
+      '(news, search results, "latest"/"current" questions, calculating ages or time differences) — do not rely on ' +
+      'your training data\'s sense of what year it is.';
+  }
+  const formatted = now.toLocaleDateString('pt-BR', {
+    timeZone: 'America/Sao_Paulo', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+  });
+  return 'LEMBRETE DE DATA: hoje é ' + formatted + '. Use isso como a data atual real pra qualquer coisa sensível ao ' +
+    'tempo (notícias, resultados de pesquisa, perguntas sobre "mais recente"/"atual", cálculo de idade ou diferença ' +
+    'de tempo) — não confie na sua noção de treino sobre em que ano você está.';
+}
+
 function trimToSafeBoundary(text) {
   const windowStart = Math.max(0, text.length - 800);
   const tail = text.slice(windowStart);
@@ -226,6 +253,9 @@ function normalizeHistory(incoming) {
       if (m.role === 'user') return typeof m.content === 'string' && m.content.trim();
       if (m.role === 'assistant') return (typeof m.content === 'string' && m.content.trim()) || Array.isArray(m.tool_calls);
       if (m.role === 'tool') return typeof m.content === 'string' && m.tool_call_id;
+      // 'system' vindo do front (ex: instrução do modo Pesquisa ligado) —
+      // antes caía direto no "return false" e era descartado em silêncio.
+      if (m.role === 'system') return typeof m.content === 'string' && m.content.trim();
       return false;
     })
     .slice(-60)
@@ -330,7 +360,11 @@ app.post('/', async function (req, res) {
     model: MODEL,
     messages: [{ role: 'system', content: buildSystemPrompt(lang) }]
       .concat(history)
-      .concat([{ role: 'system', content: FILE_REMINDER }, { role: 'system', content: buildLangReminder(lang) }]),
+      .concat([
+        { role: 'system', content: FILE_REMINDER },
+        { role: 'system', content: buildDateReminder(lang) },
+        { role: 'system', content: buildLangReminder(lang) }
+      ]),
     temperature: 0.7,
     top_p: 0.95,
     max_tokens: MAX_TOKENS,
