@@ -454,6 +454,21 @@ function buildSystemPrompt(
   'Chame-a sozinha, sem combinar com outra chamada na mesma resposta.\n\n' +
 
 
+  'FERRAMENTA github — QUANDO CONSULTAR O GITHUB: você tem uma ferramenta chamada "github" (sempre disponível, ' +
+  'independe do modo Pesquisa) que consulta a API real do GitHub — busca de código (search_code), busca de ' +
+  'repositórios (search_repos), leitura de arquivo específico (get_file), listagem de pasta (list_dir), metadados ' +
+  'de repositório como stars/linguagem/descrição (repo_info) e última versão publicada de uma lib/framework ' +
+  '(latest_release). Use esta ferramenta PROATIVAMENTE, sem o usuário precisar pedir, sempre que: (a) precisar ' +
+  'confirmar a versão mais recente de uma biblioteca/framework antes de recomendá-la ou usá-la em código gerado; ' +
+  '(b) quiser um exemplo real de uso de uma API/lib em vez de escrever de memória e arriscar sintaxe desatualizada ' +
+  'ou inventada; (c) o usuário pedir explicitamente pra ver/ler código de um repositório específico do GitHub; ' +
+  '(d) precisar decidir entre duas libs e quiser comparar popularidade (stars) ou ver se um projeto ainda está ' +
+  'mantido (campo archived/updated_at). Prefira github a web_search quando o que você precisa é um dado técnico ' +
+  'exato (versão, conteúdo de arquivo, metadado de repo) — web_search é melhor pra notícia/contexto geral, github ' +
+  'é melhor pra dado estruturado direto da fonte. Não anuncie que vai usar a ferramenta nem explique o processo de ' +
+  'busca ao usuário; apenas chame e use o resultado naturalmente na resposta.\n\n' +
+
+
   'IMPORTANTE — NÃO CONFUNDA PEDIDO DE IMAGEM COM PEDIDO DE CÓDIGO: um pedido como "crie uma imagem", "gere uma foto", ' +
   '"faça uma ilustração", "desenhe" ou equivalente, quando a intenção é obter uma imagem visual, é um pedido de imagem, ' +
   'não um pedido para programar uma representação da imagem. Nesses casos, siga EXCLUSIVAMENTE as regras do estado de ' +
