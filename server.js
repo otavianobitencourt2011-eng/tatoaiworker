@@ -1915,6 +1915,7 @@ app.post(
               }
 
 
+              let streamedToolDelta = false;
               if (
                 tc.function &&
                 typeof
@@ -1925,6 +1926,25 @@ app.post(
                   .function
                   .arguments +=
                   tc.function.arguments;
+                streamedToolDelta = true;
+              }
+
+              if (tc.function && tc.function.name) {
+                streamedToolDelta = true;
+              }
+
+              if (streamedToolDelta) {
+                send({
+                  type: 'tool_delta',
+                  index: i,
+                  id: tc.id || toolCallsAcc[i].id || '',
+                  name: tc.function && tc.function.name
+                    ? tc.function.name
+                    : toolCallsAcc[i].function.name,
+                  arguments: tc.function && typeof tc.function.arguments === 'string'
+                    ? tc.function.arguments
+                    : ''
+                });
               }
             }
           }
