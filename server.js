@@ -2195,17 +2195,25 @@ app.post(
 // START
 // ============================================================
 
-const PORT =
-  process.env.PORT ||
-  3000;
+const PORT = Number(process.env.PORT) || 10000;
+const HOST = '0.0.0.0';
 
-
-app.listen(
+// Render fica na frente do Node com um proxy HTTP.
+// Mantemos conexões longas para o streaming SSE da IA.
+const httpServer = app.listen(
   PORT,
+  HOST,
   function () {
     console.log(
-      'Tato server rodando na porta ' +
+      'Tato server rodando em http://' +
+      HOST + ':' +
       PORT
     );
   }
 );
+
+// Evita que o próprio Node encerre conexões longas antes do streaming terminar.
+httpServer.keepAliveTimeout = 120000;
+httpServer.headersTimeout = 125000;
+httpServer.requestTimeout = 0;
+httpServer.timeout = 0;
