@@ -27,14 +27,17 @@ const FLUSH_MS = 60;
 // conforme o exemplo oficial da NVIDIA/StepFun. "high" dá o raciocínio
 // mais profundo, melhor pra código/jogos complexos, ao custo de mais
 // tokens gastos pensando antes de escrever a resposta final.
-const MAX_TOKENS = 131072;
+const MAX_TOKENS_STANDARD = 131072;
+const MAX_TOKENS_PRO = 262144;
+const PRO_REASONING_CHECKPOINT_TOKENS = 250000;
 
 // "high" gasta bastante do budget de tokens só raciocinando — em pedidos
 // grandes (jogo/app completo) isso pode consumir o MAX_TOKENS inteiro
 // antes do modelo sequer começar a escrever a resposta final, resultando
 // em resposta vazia/truncada. "medium" dá um raciocínio bom mantendo mais
 // espaço livre pra escrever o arquivo de verdade.
-const REASONING_EFFORT = 'medium';
+const REASONING_EFFORT_STANDARD = 'medium';
+const REASONING_EFFORT_PRO = 'high';
 
 // O idioma de resposta agora é dinâmico (vem do campo "lang" que o
 // frontend manda no body: "pt-BR" ou "en-US", conforme a escolha da
@@ -1150,6 +1153,20 @@ app.post(
         ? 'en-US'
         : 'pt-BR';
 
+    const requestedModelMode = String(body && body.model_mode || 'tato-1.1').trim();
+    const modelMode =
+      requestedModelMode === 'tato-2.1-pro'
+        ? 'tato-2.1-pro'
+        : 'tato-1.1';
+    const requestMaxTokens =
+      modelMode === 'tato-2.1-pro'
+        ? MAX_TOKENS_PRO
+        : MAX_TOKENS_STANDARD;
+    const requestReasoningEffort =
+      modelMode === 'tato-2.1-pro'
+        ? REASONING_EFFORT_PRO
+        : REASONING_EFFORT_STANDARD;
+
 
     const imageContext =
       normalizeImageContext(
@@ -1244,13 +1261,13 @@ app.post(
 
 
       max_tokens:
-        MAX_TOKENS,
+        requestMaxTokens,
 
 
       chat_template_kwargs:
         {
           reasoning_effort:
-            REASONING_EFFORT
+            requestReasoningEffort
         },
 
 
@@ -1518,6 +1535,27 @@ app.post(
 
     const think =
       makeThinkFilter();
+
+    let estimatedThinkingTokens = 0;
+    let reasoningCheckpointSent = false;
+
+    function registerThinking(text) {
+      if (!text) return;
+      estimatedThinkingTokens += Math.ceil(String(text).length / 4);
+
+      if (
+        modelMode === 'tato-2.1-pro' &&
+        !reasoningCheckpointSent &&
+        estimatedThinkingTokens >= PRO_REASONING_CHECKPOINT_TOKENS
+      ) {
+        reasoningCheckpointSent = true;
+        send({
+          type: 'reasoning_checkpoint',
+          estimatedTokens: estimatedThinkingTokens,
+          threshold: PRO_REASONING_CHECKPOINT_TOKENS
+        });
+      }
+    }
 
 
     const toolCallsAcc =
@@ -1885,6 +1923,7 @@ app.post(
             pendingThinking +=
               delta.reasoning_content;
 
+            registerThinking(delta.reasoning_content);
             scheduleFlush();
           }
 
@@ -1910,6 +1949,7 @@ app.post(
               pendingThinking +=
                 parts.thinking;
 
+              registerThinking(parts.thinking);
               scheduleFlush();
             }
 
@@ -2276,7 +2316,11 @@ app.post(
       },
 
       limitReached:
-        limitReached
+        limitReached,
+      modelMode:
+        modelMode,
+      reasoningCheckpoint:
+        modelMode === 'tato-2.1-pro' && reasoningCheckpointSent
     });
 
 
