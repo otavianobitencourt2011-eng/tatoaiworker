@@ -27,6 +27,7 @@ const FLUSH_MS = 60;
 // conforme o exemplo oficial da NVIDIA/StepFun. "high" dá o raciocínio
 // mais profundo, melhor pra código/jogos complexos, ao custo de mais
 // tokens gastos pensando antes de escrever a resposta final.
+const MAX_TOKENS_FAST = 70000;
 const MAX_TOKENS_STANDARD = 131072;
 const MAX_TOKENS_PRO = 262144;
 const PRO_REASONING_CHECKPOINT_TOKENS = 250000;
@@ -36,8 +37,16 @@ const PRO_REASONING_CHECKPOINT_TOKENS = 250000;
 // antes do modelo sequer começar a escrever a resposta final, resultando
 // em resposta vazia/truncada. "medium" dá um raciocínio bom mantendo mais
 // espaço livre pra escrever o arquivo de verdade.
+const REASONING_EFFORT_FAST = 'low';
 const REASONING_EFFORT_STANDARD = 'medium';
 const REASONING_EFFORT_PRO = 'high';
+
+// Limite de tamanho de arquivo por modo (em bytes) — usado só como
+// referência do backend; a validação de verdade acontece no frontend antes
+// do upload, mas mantemos aqui pra eventual validação futura no servidor.
+const MAX_FILE_BYTES_FAST = 300 * 1024; // 300 KB
+const MAX_FILE_BYTES_STANDARD = 1 * 1024 * 1024; // 1 MB
+const MAX_FILE_BYTES_PRO = 3 * 1024 * 1024; // 3 MB
 
 // O idioma de resposta agora é dinâmico (vem do campo "lang" que o
 // frontend manda no body: "pt-BR" ou "en-US", conforme a escolha da
@@ -1157,15 +1166,21 @@ app.post(
     const modelMode =
       requestedModelMode === 'tato-2.1-pro'
         ? 'tato-2.1-pro'
-        : 'tato-1.1';
+        : requestedModelMode === 'tato-0.6-fast'
+          ? 'tato-0.6-fast'
+          : 'tato-1.1';
     const requestMaxTokens =
       modelMode === 'tato-2.1-pro'
         ? MAX_TOKENS_PRO
-        : MAX_TOKENS_STANDARD;
+        : modelMode === 'tato-0.6-fast'
+          ? MAX_TOKENS_FAST
+          : MAX_TOKENS_STANDARD;
     const requestReasoningEffort =
       modelMode === 'tato-2.1-pro'
         ? REASONING_EFFORT_PRO
-        : REASONING_EFFORT_STANDARD;
+        : modelMode === 'tato-0.6-fast'
+          ? REASONING_EFFORT_FAST
+          : REASONING_EFFORT_STANDARD;
 
 
     const imageContext =
