@@ -807,6 +807,41 @@ function normalizeHistory(
 
 
 // ============================================================
+// DETECÇÃO DE PEDIDO EXPLÍCITO DE GITHUB
+// ============================================================
+
+function getLatestUserMessage(history) {
+  if (!Array.isArray(history)) return '';
+  for (let i = history.length - 1; i >= 0; i--) {
+    const message = history[i];
+    if (message && message.role === 'user' && typeof message.content === 'string') {
+      return message.content.trim();
+    }
+  }
+  return '';
+}
+
+function isExplicitGithubRequest(history) {
+  const text = getLatestUserMessage(history);
+  if (!text) return false;
+  const normalized = text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  if (
+    /\bnao\b[\s\S]{0,40}\bgithub\b/i.test(normalized) ||
+    /\bsem\b[\s\S]{0,40}\bgithub\b/i.test(normalized) ||
+    /\bdont\b[\s\S]{0,40}\bgithub\b/i.test(normalized) ||
+    /\bdo not\b[\s\S]{0,40}\bgithub\b/i.test(normalized)
+  ) return false;
+  if (/github\.com\//i.test(text)) return true;
+  if (!/\bgithub\b/i.test(normalized)) return false;
+  return (
+    /\b(use|usar|utilize|utilizar|consulte|consultar|pesquise|pesquisar|busque|buscar|procure|procurar|leia|ler|abra|abrir|acesse|acessar)\b[\s\S]{0,80}\bgithub\b/i.test(normalized) ||
+    /\bgithub\b[\s\S]{0,80}\b(use|usar|utilize|utilizar|consulte|consultar|pesquise|pesquisar|busque|buscar|procure|procurar|leia|ler|abra|abrir|acesse|acessar)\b/i.test(normalized) ||
+    /\bferramenta\b[\s\S]{0,40}\bgithub\b/i.test(normalized) ||
+    /\bgithub\s+(?:api|repo|repositorio|codigo|arquivo|arquivos|lib|biblioteca|versao|release)\b/i.test(normalized)
+  );
+}
+
+// ============================================================
 // THINK FILTER
 // ============================================================
 
@@ -1090,6 +1125,22 @@ app.post(
         : undefined;
 
 
+    const hasGithubTool =
+      Array.isArray(tools) &&
+      tools.some(function (tool) {
+        return tool && tool.function && tool.function.name === 'github';
+      });
+
+    const explicitGithubRequest =
+      isExplicitGithubRequest(history);
+
+    if (explicitGithubRequest) {
+      console.log(
+        'Pedido explícito de GitHub detectado — ferramenta:',
+        hasGithubTool ? 'FORÇADA' : 'INDISPONÍVEL NO REQUEST'
+      );
+    }
+
     const lang =
       (
         body &&
@@ -1167,7 +1218,19 @@ app.post(
                   imageContext,
                   tools
                 )
-            }
+            },
+
+            ...(explicitGithubRequest && hasGithubTool
+              ? [{
+                  role: 'system',
+                  content:
+                    'GITHUB TOOL OVERRIDE: o pedido atual do usuário menciona explicitamente GitHub. ' +
+                    'É OBRIGATÓRIO chamar a ferramenta github nesta resposta antes de responder. ' +
+                    'Não responda apenas de memória e não substitua a chamada por web_search. ' +
+                    'Use a operação do GitHub mais adequada ao pedido atual. ' +
+                    'Depois de receber o resultado da ferramenta, responda normalmente.'
+                }]
+              : [])
           ]
         ),
 
@@ -1203,8 +1266,19 @@ app.post(
       payload.tools =
         tools;
 
-      payload.tool_choice =
-        'auto';
+      // Em pedido explícito de GitHub, a API é instruída a chamar a função
+      // diretamente. Isso evita depender apenas da decisão do modelo.
+      if (explicitGithubRequest && hasGithubTool) {
+        payload.tool_choice = {
+          type: 'function',
+          function: {
+            name: 'github'
+          }
+        };
+      } else {
+        payload.tool_choice =
+          'auto';
+      }
     }
 
 
