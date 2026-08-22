@@ -1232,7 +1232,7 @@ app.post(
 
 
       temperature:
-        0.1,
+        0.9,
 
 
       top_p:
