@@ -20,9 +20,9 @@ const FETCH_TIMEOUT_MS = 1200000; // 20 minutos (era 5 min — cortava em respos
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
 
-// Tato opera em um único modo de raciocínio: high.
+// Tato opera em um único modo de raciocínio: medium.
 const MAX_TOKENS_STANDARD = 260000;
-const REASONING_EFFORT_STANDARD = 'high';
+const REASONING_EFFORT_STANDARD = 'medium';
 
 // Limite único de tamanho de arquivo no backend.
 const MAX_FILE_BYTES_STANDARD = 1 * 1024 * 1024;
@@ -1141,7 +1141,7 @@ app.post(
         ? 'en-US'
         : 'pt-BR';
 
-    // O backend ignora qualquer modo enviado pelo cliente e usa sempre high.
+    // O backend ignora qualquer modo enviado pelo cliente e usa sempre medium.
     const modelMode = 'tato-1.1';
     const requestMaxTokens = MAX_TOKENS_STANDARD;
     const requestReasoningEffort = REASONING_EFFORT_STANDARD;
