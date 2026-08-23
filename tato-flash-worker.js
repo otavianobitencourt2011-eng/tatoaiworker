@@ -33,10 +33,12 @@ app.get('/', (req, res) => {
 });
 
 app.post('/', async (req, res) => {
-  res.set('Content-Type', 'application/json; charset=utf-8');
+  // A chave não configurada é o único erro que ainda respondemos como JSON
+  // simples — acontece antes de qualquer streaming começar.
   try {
     if (!AGNES_API_KEY) {
       console.error('[tato-flash-worker] AGNES_API_KEY não configurada.');
+      res.set('Content-Type', 'application/json; charset=utf-8');
       return res.status(500).json({ ok: false, error: 'Servidor sem chave configurada.' });
     }
 
@@ -51,7 +53,7 @@ app.post('/', async (req, res) => {
     // mesmo formato, então só precisamos repassar adiante.
     // max_tokens no teto documentado da Agnes 2.5/2.6 Flash (65.536 ~ 65.5K).
     const AGNES_MAX_OUTPUT_TOKENS = 65536;
-    const upstreamBody = { model: AGNES_MODEL, messages: chatMessages, stream: false, max_tokens: AGNES_MAX_OUTPUT_TOKENS };
+    const upstreamBody = { model: AGNES_MODEL, messages: chatMessages, stream: true, max_tokens: AGNES_MAX_OUTPUT_TOKENS };
     if (Array.isArray(tools) && tools.length) {
       upstreamBody.tools = tools;
       upstreamBody.tool_choice = tool_choice || 'auto';
@@ -72,40 +74,117 @@ app.post('/', async (req, res) => {
       body: JSON.stringify(upstreamBody)
     });
 
-    if (!upstream.ok) {
+    if (!upstream.ok || !upstream.body) {
       const text = await upstream.text().catch(() => '');
       console.error('[tato-flash-worker] Erro upstream:', upstream.status, text);
+      res.set('Content-Type', 'application/json; charset=utf-8');
       return res.status(502).json({ ok: false, error: 'Falha ao falar com a Agnes.' });
     }
 
-    const data = await upstream.json();
-    const message = data?.choices?.[0]?.message || {};
-    const toolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length
-      ? message.tool_calls
-      : null;
-    // O raciocínio (thinking) pode vir em campos diferentes dependendo da
-    // versão/rota da Agnes — cobre os formatos documentados.
-    const reasoning =
-      message.reasoning_content ||
-      message.reasoning ||
-      (Array.isArray(message.content) && message.content.find(function (c) { return c && c.type === 'reasoning_text'; })?.reasoning_text) ||
-      null;
+    // A partir daqui a resposta é SSE no mesmo protocolo que o Tato já usa
+    // pro worker principal (evento "thinking" pro raciocínio em tempo real,
+    // "done" com a mensagem final completa, "error" em caso de falha).
+    res.set({
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive'
+    });
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-    // Quando o modelo pede pra chamar uma tool, o Tato espera receber a
-    // mensagem inteira (com tool_calls) e não só um texto — sem isso o
-    // Code Assist nunca sabe que precisa executar read_file/write_file/etc.
-    if (toolCalls) {
-      return res.json({
-        ok: true,
-        message: { role: 'assistant', content: message.content || null, tool_calls: toolCalls },
-        thinking: reasoning || undefined
-      });
+    const send = (evt) => { res.write('data: ' + JSON.stringify(evt) + '\n\n'); };
+
+    const reader = upstream.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let content = '';
+    // Chamadas de tool vêm em pedaços (index, id, function.name/arguments
+    // parciais) — precisa acumular por índice até o fim do stream.
+    const toolCallsAcc = {};
+
+    const handleUpstreamChunk = (obj) => {
+      const choice = obj && obj.choices && obj.choices[0];
+      if (!choice) return;
+      const delta = choice.delta || {};
+
+      // Raciocínio (thinking): nome do campo varia conforme a rota da
+      // Agnes — cobre os formatos documentados. Isso SIM é transmitido em
+      // tempo real, pedaço a pedaço, pro botão de cérebro fazer sentido.
+      const reasoningPiece =
+        (typeof delta.reasoning_content === 'string' && delta.reasoning_content) ||
+        (typeof delta.reasoning === 'string' && delta.reasoning) ||
+        (typeof delta.reasoning_text === 'string' && delta.reasoning_text) ||
+        '';
+      if (reasoningPiece) send({ type: 'thinking', text: reasoningPiece });
+
+      // Resposta final: por pedido, NÃO é transmitida aos poucos — só
+      // acumulamos aqui e mandamos tudo de uma vez no evento "done".
+      if (typeof delta.content === 'string' && delta.content) {
+        content += delta.content;
+      }
+
+      if (Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          const idx = typeof tc.index === 'number' ? tc.index : 0;
+          if (!toolCallsAcc[idx]) {
+            toolCallsAcc[idx] = { id: tc.id || ('call_' + idx), type: 'function', function: { name: '', arguments: '' } };
+          }
+          if (tc.id) toolCallsAcc[idx].id = tc.id;
+          if (tc.function) {
+            if (typeof tc.function.name === 'string') toolCallsAcc[idx].function.name += tc.function.name;
+            if (typeof tc.function.arguments === 'string') toolCallsAcc[idx].function.arguments += tc.function.arguments;
+          }
+        }
+      }
+    };
+
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+
+        let idx;
+        while ((idx = buffer.indexOf('\n\n')) !== -1) {
+          const rawEvent = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          const line = rawEvent.split('\n').find(function (l) { return l.indexOf('data:') === 0; });
+          if (!line) continue;
+          const dataStr = line.slice(5).trim();
+          if (!dataStr || dataStr === '[DONE]') continue;
+          let obj;
+          try { obj = JSON.parse(dataStr); } catch (_) { continue; }
+          handleUpstreamChunk(obj);
+        }
+      }
+    } catch (streamErr) {
+      console.error('[tato-flash-worker] Erro lendo stream da Agnes:', streamErr);
+      send({ type: 'error', error: 'A conexão com a Agnes caiu no meio da resposta.' });
+      return res.end();
     }
 
-    const reply = message.content ?? data?.reply ?? data?.output_text ?? '';
-    return res.json({ ok: true, reply, thinking: reasoning || undefined });
+    const toolCallsList = Object.keys(toolCallsAcc)
+      .sort(function (a, b) { return Number(a) - Number(b); })
+      .map(function (k) { return toolCallsAcc[k]; })
+      .filter(function (tc) { return tc.function && tc.function.name; });
+
+    send({
+      type: 'done',
+      message: {
+        role: 'assistant',
+        content: content || (toolCallsList.length ? null : ''),
+        tool_calls: toolCallsList.length ? toolCallsList : undefined
+      }
+    });
+    res.end();
   } catch (err) {
     console.error('[tato-flash-worker] Erro inesperado:', err);
+    if (res.headersSent) {
+      try {
+        res.write('data: ' + JSON.stringify({ type: 'error', error: 'Erro interno no worker.' }) + '\n\n');
+      } catch (_) {}
+      return res.end();
+    }
+    res.set('Content-Type', 'application/json; charset=utf-8');
     return res.status(500).json({ ok: false, error: 'Erro interno no worker.' });
   }
 });
