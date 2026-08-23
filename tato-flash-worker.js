@@ -14,7 +14,7 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = Number(process.env.PORT) || 3000;
 const AGNES_API_KEY = String(process.env.AGNES_API_KEY || '').trim();
 const AGNES_API_URL = String(
-  process.env.AGNES_API_URL || 'https://api.agnes.ai/v1/chat/completions'
+  process.env.AGNES_API_URL || 'https://apihub.agnes.ai/v1/chat/completions'
 ).trim();
 const AGNES_MODEL = 'agnes-2.5-flash';
 const REQUEST_TIMEOUT_MS = Math.max(10_000, Number(process.env.UPSTREAM_TIMEOUT_MS) || 120_000);
