@@ -49,7 +49,9 @@ app.post('/', async (req, res) => {
     // O Tato manda `tools` (schema padrão OpenAI: {type:'function', function:{...}})
     // sempre que o Code Assist está ativo — a Agnes é compatível com esse
     // mesmo formato, então só precisamos repassar adiante.
-    const upstreamBody = { model: AGNES_MODEL, messages: chatMessages, stream: false };
+    // max_tokens no teto documentado da Agnes 2.5/2.6 Flash (65.536 ~ 65.5K).
+    const AGNES_MAX_OUTPUT_TOKENS = 65536;
+    const upstreamBody = { model: AGNES_MODEL, messages: chatMessages, stream: false, max_tokens: AGNES_MAX_OUTPUT_TOKENS };
     if (Array.isArray(tools) && tools.length) {
       upstreamBody.tools = tools;
       upstreamBody.tool_choice = tool_choice || 'auto';
