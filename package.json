@@ -1,17 +1,15 @@
 {
-  "name": "tatopro-worker",
+  "name": "tato-chat-server",
   "version": "1.0.0",
-  "description": "Worker do Tato IA para o Render, usando a TOKIA API com o modelo qwen3.7-flash",
-  "main": "tatopro.js",
-  "type": "commonjs",
-  "scripts": {
-    "start": "node tatopro.js"
-  },
+  "private": true,
+  "type": "module",
   "engines": {
     "node": ">=18"
   },
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
-    "cors": "^2.8.5",
     "express": "^4.19.2"
   }
 }
