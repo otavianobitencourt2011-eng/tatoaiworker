@@ -7,7 +7,7 @@ const cors = require('cors');
 const PORT = process.env.PORT || 3000;
 const TOKIA_API_KEY = process.env.TOKIA_API_KEY;
 const TOKIA_API_URL = process.env.TOKIA_API_URL || 'https://api.usetokia.com/v1/chat/completions';
-const TOKIA_MODEL = process.env.TOKIA_MODEL || 'openrouter/~deepseek/deepseek-v4-flash-latest';
+const TOKIA_MODEL = process.env.TOKIA_MODEL || 'openrouter/deepseek/deepseek-v4-flash';
 const MAX_TOKENS = Number(process.env.TOKIA_MAX_TOKENS || 4096);
 const TEMPERATURE = process.env.TOKIA_TEMPERATURE !== undefined ? Number(process.env.TOKIA_TEMPERATURE) : 0.7;
 const UPSTREAM_TIMEOUT_MS = Number(process.env.TOKIA_TIMEOUT_MS || 45000);
