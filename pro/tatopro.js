@@ -1,22 +1,5 @@
-// tatopro.js
-// Worker do Tato IA (Render) — fala com a TOKIA API (OpenAI-compatible)
-// usando o modelo qwen3.7-flash, em streaming.
-//
-// Contrato de entrada (o que o front tato-2.html manda em POST /):
-//   {
-//     messages: [...],                 // formato OpenAI (role/content)
-//     tools: [...],                    // definições de tool no formato OpenAI
-//     lang: 'pt' | ...,
-//     image_context: { state: 'guest' | 'authenticated_on' | 'authenticated_off' },
-//     model_mode: 'tato-...' ,
-//     tato_model_mode: 'tato-...',
-//     chat_template_kwargs: { enable_thinking: true } // opcional
-//   }
-//
-// Contrato de saída: SSE (Server-Sent Events), cada evento no formato
-//   data: {"type": "...", ...}\n\n
-// Tipos usados pelo front: delta, thinking, tool_delta, reasoning_checkpoint,
-// done, error. Ver função askTato() em tato-2.html.
+// Tato Ultimate Worker — Render
+// Gateway OpenAI-compatible -> TOKIA API, com streaming SSE e tool calling.
 
 const express = require('express');
 const cors = require('cors');
@@ -24,32 +7,26 @@ const cors = require('cors');
 const PORT = process.env.PORT || 3000;
 const TOKIA_API_KEY = process.env.TOKIA_API_KEY;
 const TOKIA_API_URL = process.env.TOKIA_API_URL || 'https://api.usetokia.com/v1/chat/completions';
-const TOKIA_MODEL = process.env.TOKIA_MODEL || 'qwen3.7-flash';
+const TOKIA_MODEL = process.env.TOKIA_MODEL || 'openrouter-qwen-qwen3-7-flash';
 const MAX_TOKENS = Number(process.env.TOKIA_MAX_TOKENS || 4096);
-const TEMPERATURE = process.env.TOKIA_TEMPERATURE !== undefined
-  ? Number(process.env.TOKIA_TEMPERATURE)
-  : 0.7;
-
-if (!TOKIA_API_KEY) {
-  console.warn('[tatopro] ATENÇÃO: variável de ambiente TOKIA_API_KEY não configurada. As requisições vão falhar com 401.');
-}
+const TEMPERATURE = process.env.TOKIA_TEMPERATURE !== undefined ? Number(process.env.TOKIA_TEMPERATURE) : 0.7;
+const UPSTREAM_TIMEOUT_MS = Number(process.env.TOKIA_TIMEOUT_MS || 45000);
+const HEARTBEAT_MS = 10000;
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
 
-// Helper: escreve um evento SSE no formato que o front espera.
 function sendEvent(res, payload) {
+  if (res.writableEnded) return;
   res.write('data: ' + JSON.stringify(payload) + '\n\n');
 }
 
-// Helper: monta o system prompt do Tato a partir do idioma pedido.
 function buildSystemPrompt(lang) {
   const isPt = !lang || String(lang).toLowerCase().startsWith('pt');
-  if (isPt) {
-    return 'Você é o Tato, um assistente de IA. Responda de forma direta, clara e útil, em português do Brasil, a menos que o usuário peça outro idioma.';
-  }
-  return 'You are Tato, an AI assistant. Respond clearly and helpfully in the language the user is using.';
+  return isPt
+    ? 'Você é o Tato, um assistente de IA. Responda de forma direta, clara e útil, em português do Brasil, a menos que o usuário peça outro idioma.'
+    : 'You are Tato, an AI assistant. Respond clearly and helpfully in the language the user is using.';
 }
 
 app.get('/', function (req, res) {
@@ -57,7 +34,7 @@ app.get('/', function (req, res) {
 });
 
 app.get('/health', function (req, res) {
-  res.json({ status: 'ok' });
+  res.json({ status: 'ok', worker: 'tatopro', model: TOKIA_MODEL });
 });
 
 app.post('/', async function (req, res) {
@@ -79,139 +56,183 @@ app.post('/', async function (req, res) {
 
   const tokiaPayload = {
     model: TOKIA_MODEL,
-    messages: messages,
+    messages,
     stream: true,
     max_tokens: MAX_TOKENS,
     temperature: TEMPERATURE
   };
+
   if (tools.length) {
     tokiaPayload.tools = tools;
     tokiaPayload.tool_choice = 'auto';
   }
-  // Qwen (via Tokia) usa esse campo pra ligar o "thinking" quando suportado.
-  if (enableThinking) tokiaPayload.chat_template_kwargs = { enable_thinking: true };
 
-  // Cabeçalhos de streaming pro cliente (front espera text/event-stream).
+  if (enableThinking) {
+    tokiaPayload.chat_template_kwargs = { enable_thinking: true };
+  }
+
   res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
+    'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no'
   });
 
   const controller = new AbortController();
-  let upstreamFinished = false;
+  let finished = false;
 
-  // NÃO usar req.on('close') aqui: no Node/Express, o request pode emitir
-  // 'close' após o body terminar de ser recebido, mesmo com o cliente ainda
-  // esperando a resposta. Isso abortava a chamada à TOKIA imediatamente.
-  req.on('aborted', function () {
-    if (!upstreamFinished && !controller.signal.aborted) controller.abort();
-  });
+  function abortUpstream() {
+    if (!finished && !controller.signal.aborted) controller.abort();
+  }
 
+  req.on('aborted', abortUpstream);
   res.on('close', function () {
-    if (!upstreamFinished && !res.writableEnded && !controller.signal.aborted) {
-      controller.abort();
-    }
+    if (!finished && !res.writableEnded) abortUpstream();
   });
 
-  // Acumuladores pra montar a mensagem final no evento "done".
+  // Mantém a conexão SSE ativa mesmo quando o provider demora para gerar o primeiro token.
+  const heartbeat = setInterval(function () {
+    if (!finished && !res.writableEnded) sendEvent(res, { type: 'heartbeat' });
+  }, HEARTBEAT_MS);
+
   let finalContent = '';
-  let finalThinking = '';
-  // toolCallsByIndex: { [index]: { id, type, function: { name, arguments } } }
   const toolCallsByIndex = {};
   let finishReason = null;
 
   try {
-    const upstream = await fetch(TOKIA_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bearer ' + TOKIA_API_KEY
-      },
-      body: JSON.stringify(tokiaPayload),
-      signal: controller.signal
-    });
+    const timeout = setTimeout(function () {
+      controller.abort();
+    }, UPSTREAM_TIMEOUT_MS);
 
-    if (!upstream.ok || !upstream.body) {
-      const rawErr = await upstream.text().catch(function () { return ''; });
-      let parsedErr = null;
-      try { parsedErr = rawErr ? JSON.parse(rawErr) : null; } catch (_) {}
-      const msg = (parsedErr && parsedErr.error && (parsedErr.error.message || parsedErr.error.type))
-        || rawErr
-        || ('Falha ao falar com a TOKIA API (' + upstream.status + ')');
-      sendEvent(res, { type: 'error', error: msg });
-      res.end();
+    let upstream;
+    try {
+      upstream = await fetch(TOKIA_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream, application/json',
+          Authorization: 'Bearer ' + TOKIA_API_KEY
+        },
+        body: JSON.stringify(tokiaPayload),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!upstream.ok) {
+      const raw = await upstream.text().catch(function () { return ''; });
+      let parsed = null;
+      try { parsed = raw ? JSON.parse(raw) : null; } catch (_) {}
+      const msg = (parsed && parsed.error && (parsed.error.message || parsed.error.type))
+        || (parsed && (parsed.message || parsed.detail))
+        || raw
+        || ('TOKIA HTTP ' + upstream.status);
+      sendEvent(res, { type: 'error', error: String(msg) });
+      return;
+    }
+
+    const contentType = String(upstream.headers.get('content-type') || '').toLowerCase();
+
+    // Compatibilidade: se o provider responder JSON apesar de stream:true.
+    if (contentType.indexOf('application/json') !== -1) {
+      const raw = await upstream.text();
+      let payload = {};
+      try { payload = raw ? JSON.parse(raw) : {}; } catch (_) { payload = { reply: raw }; }
+      if (payload.error) {
+        sendEvent(res, { type: 'error', error: typeof payload.error === 'string' ? payload.error : JSON.stringify(payload.error) });
+        return;
+      }
+      const msg = payload.message || (payload.choices && payload.choices[0] && payload.choices[0].message) || {};
+      const reply = typeof msg.content === 'string' ? msg.content : (typeof payload.reply === 'string' ? payload.reply : '');
+      const finalMessage = { role: 'assistant', content: reply };
+      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) finalMessage.tool_calls = msg.tool_calls;
+      sendEvent(res, { type: 'done', message: finalMessage, limitReached: false, reasoningCheckpoint: false });
+      return;
+    }
+
+    if (!upstream.body) {
+      sendEvent(res, { type: 'error', error: 'TOKIA respondeu sem corpo de streaming.' });
       return;
     }
 
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let streamDone = false;
 
-    while (true) {
+    function processSseEvent(rawEvent) {
+      const normalized = rawEvent.replace(/\r/g, '');
+      const dataLines = normalized.split('\n')
+        .filter(function (line) { return line.indexOf('data:') === 0; })
+        .map(function (line) { return line.slice(5).trimStart(); });
+
+      if (!dataLines.length) return false;
+      const dataStr = dataLines.join('\n').trim();
+      if (!dataStr) return false;
+      if (dataStr === '[DONE]') return true;
+
+      let evt;
+      try { evt = JSON.parse(dataStr); } catch (_) { return false; }
+      const choice = evt && evt.choices && evt.choices[0];
+      if (!choice) return false;
+
+      const delta = choice.delta || {};
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+
+      if (typeof delta.content === 'string' && delta.content) {
+        finalContent += delta.content;
+        sendEvent(res, { type: 'delta', text: delta.content });
+      }
+
+      const reasoningPiece = delta.reasoning_content || delta.reasoning;
+      if (typeof reasoningPiece === 'string' && reasoningPiece) {
+        sendEvent(res, { type: 'thinking', text: reasoningPiece });
+      }
+
+      if (Array.isArray(delta.tool_calls)) {
+        delta.tool_calls.forEach(function (tc) {
+          const i = Number.isInteger(tc.index) ? tc.index : 0;
+          if (!toolCallsByIndex[i]) {
+            toolCallsByIndex[i] = {
+              id: tc.id || ('call_' + i),
+              type: 'function',
+              function: { name: '', arguments: '' }
+            };
+          }
+          const entry = toolCallsByIndex[i];
+          if (tc.id) entry.id = tc.id;
+          if (tc.function && typeof tc.function.name === 'string') entry.function.name += tc.function.name;
+          if (tc.function && typeof tc.function.arguments === 'string') entry.function.arguments += tc.function.arguments;
+          sendEvent(res, {
+            type: 'tool_delta',
+            index: i,
+            id: entry.id,
+            name: tc.function && tc.function.name ? tc.function.name : undefined,
+            arguments: tc.function && tc.function.arguments ? tc.function.arguments : undefined
+          });
+        });
+      }
+      return false;
+    }
+
+    while (!streamDone) {
       const chunk = await reader.read();
       if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
+      buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, '\n');
 
       let idx;
       while ((idx = buffer.indexOf('\n\n')) !== -1) {
         const rawEvent = buffer.slice(0, idx);
         buffer = buffer.slice(idx + 2);
-
-        const line = rawEvent.split('\n').find(function (l) { return l.indexOf('data:') === 0; });
-        if (!line) continue;
-        const dataStr = line.slice(5).trim();
-        if (!dataStr) continue;
-        if (dataStr === '[DONE]') continue;
-
-        let evt;
-        try { evt = JSON.parse(dataStr); } catch (e) { continue; }
-
-        const choice = evt && evt.choices && evt.choices[0];
-        if (!choice) continue;
-        const delta = choice.delta || {};
-
-        if (choice.finish_reason) finishReason = choice.finish_reason;
-
-        // Texto normal da resposta.
-        if (typeof delta.content === 'string' && delta.content) {
-          finalContent += delta.content;
-          sendEvent(res, { type: 'delta', text: delta.content });
-        }
-
-        // Raciocínio (thinking) — alguns providers Qwen mandam isso em
-        // reasoning_content, seguindo a convenção do DeepSeek/Qwen.
-        const reasoningPiece = delta.reasoning_content || delta.reasoning;
-        if (typeof reasoningPiece === 'string' && reasoningPiece) {
-          finalThinking += reasoningPiece;
-          sendEvent(res, { type: 'thinking', text: reasoningPiece });
-        }
-
-        // Tool calls em streaming: cada pedaço chega com um "index" e vai
-        // sendo concatenado até fechar a chamada.
-        if (Array.isArray(delta.tool_calls)) {
-          delta.tool_calls.forEach(function (tc) {
-            const i = tc.index || 0;
-            if (!toolCallsByIndex[i]) {
-              toolCallsByIndex[i] = { id: tc.id || ('call_' + i), type: 'function', function: { name: '', arguments: '' } };
-            }
-            const entry = toolCallsByIndex[i];
-            if (tc.id) entry.id = tc.id;
-            if (tc.function && typeof tc.function.name === 'string') entry.function.name += tc.function.name;
-            if (tc.function && typeof tc.function.arguments === 'string') entry.function.arguments += tc.function.arguments;
-
-            sendEvent(res, {
-              type: 'tool_delta',
-              index: i,
-              id: entry.id,
-              name: tc.function && tc.function.name ? tc.function.name : undefined,
-              arguments: tc.function && tc.function.arguments ? tc.function.arguments : undefined
-            });
-          });
+        if (processSseEvent(rawEvent)) {
+          streamDone = true;
+          break;
         }
       }
     }
+
+    if (!streamDone && buffer.trim()) processSseEvent(buffer);
 
     const toolCalls = Object.keys(toolCallsByIndex)
       .sort(function (a, b) { return Number(a) - Number(b); })
@@ -226,18 +247,16 @@ app.post('/', async function (req, res) {
       limitReached: finishReason === 'length',
       reasoningCheckpoint: false
     });
-    upstreamFinished = true;
-    res.end();
   } catch (error) {
     if (error && error.name === 'AbortError') {
-      if (!res.writableEnded) {
-        sendEvent(res, { type: 'error', error: 'A chamada à TOKIA foi interrompida antes de terminar.' });
-        res.end();
-      }
-      return;
+      sendEvent(res, { type: 'error', error: 'A TOKIA não respondeu dentro do limite de 45 segundos ou a conexão foi interrompida.' });
+    } else {
+      sendEvent(res, { type: 'error', error: (error && error.message) || 'Erro desconhecido no worker.' });
     }
-    sendEvent(res, { type: 'error', error: (error && error.message) || 'Erro desconhecido no worker tatopro.' });
-    res.end();
+  } finally {
+    finished = true;
+    clearInterval(heartbeat);
+    if (!res.writableEnded) res.end();
   }
 });
 
