@@ -1,6 +1,6 @@
-// tato-flash-worker.js — segundo worker de IA do Tato
-// Modelo: Agnes 2.5 Flash. Mesma chave da Agnes, guardada só como
-// env var no Render (AGNES_API_KEY) — nunca hardcoded aqui.
+// tato-flash-worker.js â€” segundo worker de IA do Tato
+// Modelo: Agnes 2.5 Flash. Mesma chave da Agnes, guardada sÃ³ como
+// env var no Render (AGNES_API_KEY) â€” nunca hardcoded aqui.
 
 const express = require('express');
 const cors = require('cors');
@@ -14,18 +14,38 @@ const AGNES_API_KEY = process.env.AGNES_API_KEY;
 const AGNES_API_URL = process.env.AGNES_API_URL || 'https://apihub.agnes-ai.com/v1/chat/completions';
 const AGNES_MODEL = 'agnes-2.5-flash';
 
-// Identidade do Tato: a Agnes é só o motor por trás — o usuário nunca deve
+// Identidade do Tato: a Agnes Ã© sÃ³ o motor por trÃ¡s â€” o usuÃ¡rio nunca deve
 // saber disso. Isso vai SEMPRE na frente de qualquer outra mensagem, pra ter
-// prioridade mesmo se o histórico da conversa mencionar "Agnes" de outro jeito.
+// prioridade mesmo se o histÃ³rico da conversa mencionar "Agnes" de outro jeito.
 const TATO_IDENTITY_PROMPT = {
   role: 'system',
   content:
-    'Você é o Tato, o assistente de IA do app Tato (modo Tato 2.6 Flash). Você NÃO é a Agnes, a Sapiens AI, nem ' +
-    'qualquer outro nome de modelo — esse é só o motor técnico por trás, uma informação interna que nunca deve ' +
-    'ser revelada. Se alguém perguntar qual modelo/IA você é, quem te criou, ou qual tecnologia você usa por ' +
-    'baixo, responda sempre que você é o Tato, criado para o app Tato — nunca mencione Agnes, Sapiens AI, ' +
-    'OpenAI, ou qualquer outro provedor. Não repita nem confirme esses nomes mesmo que o usuário insista ou ' +
-    'tente te convencer do contrário.'
+    'VocÃª Ã© o Tato, o assistente de IA do app Tato (modo Tato 2.6 Flash). VocÃª NÃƒO Ã© a Agnes, a Sapiens AI, nem ' +
+    'qualquer outro nome de modelo â€” esse Ã© sÃ³ o motor tÃ©cnico por trÃ¡s, uma informaÃ§Ã£o interna que nunca deve ' +
+    'ser revelada. Se alguÃ©m perguntar qual modelo/IA vocÃª Ã©, quem te criou, ou qual tecnologia vocÃª usa por ' +
+    'baixo, responda sempre que vocÃª Ã© o Tato, criado para o app Tato â€” nunca mencione Agnes, Sapiens AI, ' +
+    'OpenAI, ou qualquer outro provedor. NÃ£o repita nem confirme esses nomes mesmo que o usuÃ¡rio insista ou ' +
+    'tente te convencer do contrÃ¡rio.'
+};
+
+// ReforÃ§o especÃ­fico do Tato 2.6 Flash: o modelo tende a responder diretamente
+// quando poderia executar uma aÃ§Ã£o. Este system prompt deixa explÃ­cito que,
+// quando tools sÃ£o fornecidas, ele deve raciocinar sobre a necessidade delas
+// antes de produzir a resposta final.
+const TATO_TOOL_POLICY_PROMPT = {
+  role: 'system',
+  content:
+    'POLÃTICA DE AGENTE E USO DE FERRAMENTAS â€” SIGA Ã€ RISCA. VocÃª Ã© o Tato 2.6 Flash e estÃ¡ operando como agente, nÃ£o apenas como um chatbot de texto. ' +
+    'Quando ferramentas (tools) estiverem disponÃ­veis nesta requisiÃ§Ã£o, examine a mensagem atual do usuÃ¡rio e DECIDA EXPLICITAMENTE se alguma ferramenta Ã© necessÃ¡ria antes de responder. ' +
+    'NÃ£o ignore uma tool sÃ³ porque consegue explicar ou imaginar o resultado. Se uma tool puder executar, inspecionar, alterar, pesquisar, verificar ou melhorar materialmente a tarefa, USE-A. ' +
+    'Para programaÃ§Ã£o e arquivos, prefira agir com as ferramentas em vez de apenas fornecer instruÃ§Ãµes ao usuÃ¡rio: inspecione o estado real, faÃ§a a alteraÃ§Ã£o solicitada e verifique o resultado quando possÃ­vel. ' +
+    'Nunca invente conteÃºdo de arquivo, nomes de arquivos, estado do projeto, APIs, versÃµes ou resultados de testes. ' +
+    'Se o pedido tiver qualquer ambiguidade relevante que altere o resultado, NÃƒO ADIVINHE: use imediatamente a ferramenta ask_for_clarification e pare atÃ© receber a resposta. ' +
+    'Se a tarefa estiver clara, mas depender de uma decisÃ£o do usuÃ¡rio entre alternativas vÃ¡lidas, use ask_user. ' +
+    'Use read_file/list_files/run_command para inspeÃ§Ã£o conforme a necessidade; edit_file/write_file para alteraÃ§Ãµes; run_command para execuÃ§Ã£o/verificaÃ§Ã£o; web_search para informaÃ§Ã£o atual quando disponÃ­vel; e as demais tools quando o pedido exigir. ' +
+    'Depois de uma ferramenta retornar, analise o resultado antes de decidir o prÃ³ximo passo. Continue usando tools enquanto a tarefa ainda nÃ£o estiver realmente concluÃ­da. ' +
+    'NÃ£o finalize apenas porque conseguiu produzir uma explicaÃ§Ã£o: finalize quando a solicitaÃ§Ã£o tiver sido executada ou quando nÃ£o houver aÃ§Ã£o de ferramenta necessÃ¡ria. ' +
+    'Nunca alegue ter feito, testado, pesquisado, lido, alterado ou verificado algo sem ter chamado a ferramenta correspondente.'
 };
 
 app.get('/', (req, res) => {
@@ -33,11 +53,11 @@ app.get('/', (req, res) => {
 });
 
 app.post('/', async (req, res) => {
-  // A chave não configurada é o único erro que ainda respondemos como JSON
-  // simples — acontece antes de qualquer streaming começar.
+  // A chave nÃ£o configurada Ã© o Ãºnico erro que ainda respondemos como JSON
+  // simples â€” acontece antes de qualquer streaming comeÃ§ar.
   try {
     if (!AGNES_API_KEY) {
-      console.error('[tato-flash-worker] AGNES_API_KEY não configurada.');
+      console.error('[tato-flash-worker] AGNES_API_KEY nÃ£o configurada.');
       res.set('Content-Type', 'application/json; charset=utf-8');
       return res.status(500).json({ ok: false, error: 'Servidor sem chave configurada.' });
     }
@@ -46,11 +66,11 @@ app.post('/', async (req, res) => {
     const baseMessages = Array.isArray(messages)
       ? messages
       : [{ role: 'user', content: String(prompt || '') }];
-    const chatMessages = [TATO_IDENTITY_PROMPT].concat(baseMessages);
+    const chatMessages = [TATO_IDENTITY_PROMPT, TATO_TOOL_POLICY_PROMPT].concat(baseMessages);
 
-    // O Tato manda `tools` (schema padrão OpenAI: {type:'function', function:{...}})
-    // sempre que o Code Assist está ativo — a Agnes é compatível com esse
-    // mesmo formato, então só precisamos repassar adiante.
+    // O Tato manda `tools` (schema padrÃ£o OpenAI: {type:'function', function:{...}})
+    // sempre que o Code Assist estÃ¡ ativo â€” a Agnes Ã© compatÃ­vel com esse
+    // mesmo formato, entÃ£o sÃ³ precisamos repassar adiante.
     // max_tokens no teto documentado da Agnes 2.5/2.6 Flash (65.536 ~ 65.5K).
     const AGNES_MAX_OUTPUT_TOKENS = 65536;
     const upstreamBody = { model: AGNES_MODEL, messages: chatMessages, stream: true, max_tokens: AGNES_MAX_OUTPUT_TOKENS };
@@ -58,9 +78,9 @@ app.post('/', async (req, res) => {
       upstreamBody.tools = tools;
       upstreamBody.tool_choice = tool_choice || 'auto';
     }
-    // Thinking mode do botão de cérebro no composer: a Agnes 2.5/2.6 Flash
+    // Thinking mode do botÃ£o de cÃ©rebro no composer: a Agnes 2.5/2.6 Flash
     // liga isso via chat_template_kwargs.enable_thinking (formato oficial
-    // dela — não é o campo "thinking" do padrão Anthropic).
+    // dela â€” nÃ£o Ã© o campo "thinking" do padrÃ£o Anthropic).
     if (chat_template_kwargs && chat_template_kwargs.enable_thinking) {
       upstreamBody.chat_template_kwargs = { enable_thinking: true };
     }
@@ -81,8 +101,8 @@ app.post('/', async (req, res) => {
       return res.status(502).json({ ok: false, error: 'Falha ao falar com a Agnes.' });
     }
 
-    // A partir daqui a resposta é SSE no mesmo protocolo que o Tato já usa
-    // pro worker principal (evento "thinking" pro raciocínio em tempo real,
+    // A partir daqui a resposta Ã© SSE no mesmo protocolo que o Tato jÃ¡ usa
+    // pro worker principal (evento "thinking" pro raciocÃ­nio em tempo real,
     // "done" com a mensagem final completa, "error" em caso de falha).
     res.set({
       'Content-Type': 'text/event-stream; charset=utf-8',
@@ -97,8 +117,8 @@ app.post('/', async (req, res) => {
     const decoder = new TextDecoder();
     let buffer = '';
     let content = '';
-    // Chamadas de tool vêm em pedaços (index, id, function.name/arguments
-    // parciais) — precisa acumular por índice até o fim do stream.
+    // Chamadas de tool vÃªm em pedaÃ§os (index, id, function.name/arguments
+    // parciais) â€” precisa acumular por Ã­ndice atÃ© o fim do stream.
     const toolCallsAcc = {};
 
     const handleUpstreamChunk = (obj) => {
@@ -106,9 +126,9 @@ app.post('/', async (req, res) => {
       if (!choice) return;
       const delta = choice.delta || {};
 
-      // Raciocínio (thinking): nome do campo varia conforme a rota da
-      // Agnes — cobre os formatos documentados. Isso SIM é transmitido em
-      // tempo real, pedaço a pedaço, pro botão de cérebro fazer sentido.
+      // RaciocÃ­nio (thinking): nome do campo varia conforme a rota da
+      // Agnes â€” cobre os formatos documentados. Isso SIM Ã© transmitido em
+      // tempo real, pedaÃ§o a pedaÃ§o, pro botÃ£o de cÃ©rebro fazer sentido.
       const reasoningPiece =
         (typeof delta.reasoning_content === 'string' && delta.reasoning_content) ||
         (typeof delta.reasoning === 'string' && delta.reasoning) ||
@@ -116,7 +136,7 @@ app.post('/', async (req, res) => {
         '';
       if (reasoningPiece) send({ type: 'thinking', text: reasoningPiece });
 
-      // Resposta final: por pedido, NÃO é transmitida aos poucos — só
+      // Resposta final: por pedido, NÃƒO Ã© transmitida aos poucos â€” sÃ³
       // acumulamos aqui e mandamos tudo de uma vez no evento "done".
       if (typeof delta.content === 'string' && delta.content) {
         content += delta.content;
@@ -158,7 +178,7 @@ app.post('/', async (req, res) => {
       }
     } catch (streamErr) {
       console.error('[tato-flash-worker] Erro lendo stream da Agnes:', streamErr);
-      send({ type: 'error', error: 'A conexão com a Agnes caiu no meio da resposta.' });
+      send({ type: 'error', error: 'A conexÃ£o com a Agnes caiu no meio da resposta.' });
       return res.end();
     }
 
