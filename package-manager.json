@@ -1,0 +1,14 @@
+{
+  "name": "package-manager",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "SeekAi worker for DeepSeek V4 Pro",
+  "main": "server-manager.js",
+  "scripts": {
+    "start": "node server-manager.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
