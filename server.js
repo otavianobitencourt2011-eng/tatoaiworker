@@ -12,7 +12,7 @@
 import express from 'express';
 
 const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
-const MODEL = 'deepseek-ai/deepseek-v4-pro-0813';
+const MODEL = 'deepseek-ai/deepseek-v4-flash-0731';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
