@@ -1455,6 +1455,17 @@ app.post(
       err
     ) {
 
+      // NÃ£o esconda o erro real de conexÃ£o com a SeekAi.
+      const realError =
+        err && err.message
+          ? err.message
+          : String(err || 'Erro desconhecido');
+
+      console.error(
+        'Erro de conexÃ£o com a SeekAi:',
+        err
+      );
+
       return res
         .status(502)
         .json({
@@ -1462,7 +1473,14 @@ app.post(
             false,
 
           error:
-            'Server sobrecarregado, tente novamente mais tarde.'
+            'Erro ao conectar com a SeekAi: ' +
+            realError,
+
+          upstream_status:
+            null,
+
+          upstream_body:
+            null
         });
     }
 
@@ -1472,19 +1490,42 @@ app.post(
       !upstream.body
     ) {
 
+      const rawError =
+        (lastErrText || '').trim();
+
+      let parsedError =
+        null;
+
+      try {
+        parsedError =
+          rawError
+            ? JSON.parse(rawError)
+            : null;
+      } catch (_) {
+        parsedError = null;
+      }
+
+      // Tenta obter a mensagem real em respostas JSON comuns.
+      const realError =
+        parsedError?.error?.message ||
+        parsedError?.error?.detail ||
+        (typeof parsedError?.error === 'string'
+          ? parsedError.error
+          : null) ||
+        parsedError?.message ||
+        parsedError?.detail ||
+        parsedError?.msg ||
+        (rawError || 'Resposta vazia da SeekAi');
+
       console.error(
         'Erro upstream da IA apÃ³s retries â€” status:',
         lastErrStatus,
         'body:',
-        (
-          lastErrText ||
-          ''
-        ).slice(
+        rawError.slice(
           0,
-          300
+          2000
         )
       );
-
 
       return res
         .status(502)
@@ -1493,7 +1534,17 @@ app.post(
             false,
 
           error:
-            'Server sobrecarregado, tente novamente mais tarde.'
+            'SeekAi retornou HTTP ' +
+            String(lastErrStatus || 'desconhecido') +
+            ': ' +
+            realError,
+
+          upstream_status:
+            lastErrStatus,
+
+          upstream_body:
+            rawError ||
+            null
         });
     }
 
