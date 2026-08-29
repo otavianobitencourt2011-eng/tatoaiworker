@@ -6,19 +6,14 @@
 // no plano Free do Cloudflare Workers.
 //
 // VariÃ¡vel de ambiente necessÃ¡ria no Render (aba "Environment"):
-//   SEEKAI_API_KEY = sk-... (SeekAi / seekai.cc)
-//   SEEK_API_KEY tambÃ©m Ã© aceito como fallback por compatibilidade.
+//   SEEKAI_API_KEY = ...
+// API OpenAI-compatible da SeekAi usando DeepSeek V4 Pro.
 // ============================================================
 
 import express from 'express';
 
-// Tato 4.1 â€” mantÃ©m o mesmo worker legado que antes atendia o Tato 1.1,
-// agora apontando para o gateway SeekAi compatÃ­vel com OpenAI.
 const SEEKAI_ENDPOINT = 'https://seekai.cc/v1/chat/completions';
-const MODEL = 'z-ai/glm-5.2:free';
-const SEEKAI_API_KEY =
-  process.env.SEEKAI_API_KEY ||
-  process.env.SEEK_API_KEY;
+const MODEL = 'deepseek-v4-pro';
 
 // Rodando no Render (sem limite de CPU time por request), dÃ¡ pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -26,9 +21,8 @@ const FETCH_TIMEOUT_MS = 1200000; // 20 minutos (era 5 min â€” cortava em r
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
 
-// Tato 4.1 usa DeepSeek-V4-Flash.
-// A API aceita reasoning_effort e, por compatibilidade, mapeia "medium" para "high".
-// Mantemos "medium" no contrato do Tato sem criar um novo botÃ£o de cÃ©rebro para o 4.1.
+// Tato 4.1 usa DeepSeek V4 Pro. A API aceita low/high/max; medium Ã©
+// aceito por compatibilidade e Ã© mapeado para high. MÃ¡ximo de saÃ­da: 384K.
 const MAX_TOKENS_STANDARD = 384000;
 const REASONING_EFFORT_STANDARD = 'medium';
 
@@ -295,7 +289,10 @@ function buildSystemPrompt(
 
 
   return (
-  'VocÃª Ã© o Tato, um assistente de IA amigÃ¡vel, direto e prestativo do app Tato IA. ' +
+  'VocÃª Ã© o Tato 4.1, o agente principal do app Tato IA, executando sobre DeepSeek V4 Pro. ' +
+  'VocÃª opera como agente, nÃ£o apenas como chatbot. Quando ferramentas estiverem disponÃ­veis, avalie a solicitaÃ§Ã£o e use as ferramentas necessÃ¡rias antes de responder. ' +
+  'Em tarefas de programaÃ§Ã£o e arquivos, atue diretamente pelas ferramentas: inspecione o estado real, crie/edite os arquivos, execute verificaÃ§Ãµes e sÃ³ finalize quando a tarefa estiver concluÃ­da. ' +
+  'Nunca entregue projetos grandes ou cÃ³digo completo diretamente no chat quando uma ferramenta de arquivo puder criar o arquivo. Nunca alegue ter executado, testado, pesquisado ou alterado algo sem usar a ferramenta correspondente. ' +
   languageDirective(lang) + ' ' +
   imageDirective +
   '\n\n' +
@@ -717,6 +714,8 @@ function normalizeHistory(
                 'string' &&
               m.content.trim()
             ) ||
+            typeof m.reasoning_content ===
+              'string' ||
             Array.isArray(
               m.tool_calls
             )
@@ -788,7 +787,11 @@ function normalizeHistory(
               null,
 
             tool_calls:
-              m.tool_calls
+              m.tool_calls,
+
+            ...(typeof m.reasoning_content === 'string'
+              ? { reasoning_content: m.reasoning_content }
+              : {})
           };
         }
 
@@ -798,7 +801,11 @@ function normalizeHistory(
             m.role,
 
           content:
-            m.content.trim()
+            m.content.trim(),
+
+          ...(m.role === 'assistant' && typeof m.reasoning_content === 'string'
+            ? { reasoning_content: m.reasoning_content }
+            : {})
         };
       }
     );
@@ -1074,6 +1081,11 @@ app.post(
     res
   ) {
 
+    const SEEKAI_API_KEY =
+      process.env.SEEKAI_API_KEY ||
+      process.env.SEEK_API_KEY;
+
+
     if (!SEEKAI_API_KEY) {
       return res
         .status(500)
@@ -1145,7 +1157,7 @@ app.post(
         ? 'en-US'
         : 'pt-BR';
 
-    // O backend usa o contrato fixo do Tato 4.1; o cliente escolhe entre Tato 2.9 e Tato 4.1.
+    // Este worker Ã© o backend do Tato 4.1.
     const modelMode = 'tato-4.1';
     const requestMaxTokens = MAX_TOKENS_STANDARD;
     const requestReasoningEffort = REASONING_EFFORT_STANDARD;
@@ -1243,12 +1255,13 @@ app.post(
         0.95,
 
 
+      // O mÃ¡ximo documentado do DeepSeek V4 Pro Ã© 384K tokens, incluindo
+      // reasoning e saÃ­da visÃ­vel.
       max_tokens:
         requestMaxTokens,
 
 
-      // DeepSeek V4 usa reasoning_effort no formato OpenAI Chat Completions.
-      // "medium" Ã© aceito por compatibilidade e mapeado pelo prÃ³prio DeepSeek para high.
+      // Campos oficiais do DeepSeek V4 para thinking/reasoning.
       reasoning_effort:
         requestReasoningEffort,
 
@@ -1257,6 +1270,7 @@ app.post(
           type:
             'enabled'
         },
+
 
       stream:
         true
@@ -1455,17 +1469,6 @@ app.post(
       err
     ) {
 
-      // NÃ£o esconda o erro real de conexÃ£o com a SeekAi.
-      const realError =
-        err && err.message
-          ? err.message
-          : String(err || 'Erro desconhecido');
-
-      console.error(
-        'Erro de conexÃ£o com a SeekAi:',
-        err
-      );
-
       return res
         .status(502)
         .json({
@@ -1473,14 +1476,7 @@ app.post(
             false,
 
           error:
-            'Erro ao conectar com a SeekAi: ' +
-            realError,
-
-          upstream_status:
-            null,
-
-          upstream_body:
-            null
+            'Server sobrecarregado, tente novamente mais tarde.'
         });
     }
 
@@ -1490,42 +1486,19 @@ app.post(
       !upstream.body
     ) {
 
-      const rawError =
-        (lastErrText || '').trim();
-
-      let parsedError =
-        null;
-
-      try {
-        parsedError =
-          rawError
-            ? JSON.parse(rawError)
-            : null;
-      } catch (_) {
-        parsedError = null;
-      }
-
-      // Tenta obter a mensagem real em respostas JSON comuns.
-      const realError =
-        parsedError?.error?.message ||
-        parsedError?.error?.detail ||
-        (typeof parsedError?.error === 'string'
-          ? parsedError.error
-          : null) ||
-        parsedError?.message ||
-        parsedError?.detail ||
-        parsedError?.msg ||
-        (rawError || 'Resposta vazia da SeekAi');
-
       console.error(
         'Erro upstream da IA apÃ³s retries â€” status:',
         lastErrStatus,
         'body:',
-        rawError.slice(
+        (
+          lastErrText ||
+          ''
+        ).slice(
           0,
-          2000
+          300
         )
       );
+
 
       return res
         .status(502)
@@ -1534,17 +1507,7 @@ app.post(
             false,
 
           error:
-            'SeekAi retornou HTTP ' +
-            String(lastErrStatus || 'desconhecido') +
-            ': ' +
-            realError,
-
-          upstream_status:
-            lastErrStatus,
-
-          upstream_body:
-            rawError ||
-            null
+            'Server sobrecarregado, tente novamente mais tarde.'
         });
     }
 
@@ -1609,8 +1572,7 @@ app.post(
     let pendingThinking =
       '';
 
-    // Preserva o reasoning completo da rodada para o prÃ³ximo passo de tool-calling.
-    // O texto tambÃ©m Ã© enviado como evento "thinking" para a UI.
+    // O DeepSeek exige reasoning_content completo nas prÃ³ximas rodadas quando tools estÃ£o ativas.
     let reasoningContentAcc =
       '';
 
@@ -2291,8 +2253,8 @@ app.post(
 
           ?
 
-        'A IA gastou todo o limite de tokens pensando e nÃ£o sobrou espaÃ§o pra escrever a resposta. ' +
-        'Tente pedir algo mais simples/dividido em partes, ou baixe o nÃ­vel de reasoning.'
+        'A IA gastou todo o limite de tokens pensando e nÃ£o sobrou espaÃ§o para a resposta visÃ­vel. ' +
+        'O Tato 4.1 estÃ¡ usando reasoning_effort=' + requestReasoningEffort + '.'
 
           :
 
