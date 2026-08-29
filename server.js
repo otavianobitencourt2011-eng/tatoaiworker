@@ -6,14 +6,19 @@
 // no plano Free do Cloudflare Workers.
 //
 // Variável de ambiente necessária no Render (aba "Environment"):
-//   SEEKAI_API_KEY = ...
-// API OpenAI-compatible da SeekAi usando DeepSeek V4 Pro.
+//   BAI_API_KEY = ...
+// API OpenAI-compatible da B.AI (endpoint /v1/chat/completions) usando o
+// modelo gratuito Qwen3.8-Flash.
 // ============================================================
 
 import express from 'express';
 
-const SEEKAI_ENDPOINT = 'https://seekai.cc/v1/chat/completions';
-const MODEL = 'deepseek-v4-pro';
+const BAI_ENDPOINT = 'https://api.b.ai/v1/chat/completions';
+// ATENÇÃO: confirme esse ID exato na aba de modelos do painel da B.AI
+// (ou via GET https://api.b.ai/v1/models com sua chave) antes de subir pro
+// Render — a doc pública usa "your-model-id" como placeholder, o slug real
+// pode variar (ex: "qwen3.8-flash", "qwen/qwen3.8-flash").
+const MODEL = 'qwen3.8-flash';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -21,8 +26,14 @@ const FETCH_TIMEOUT_MS = 1200000; // 20 minutos (era 5 min — cortava em respos
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
 
-// Tato 4.1 usa DeepSeek V4 Pro. A API aceita low/high/max; medium é
-// aceito por compatibilidade e é mapeado para high. Máximo de saída: 384K.
+// Tato 4.1 agora roda sobre Qwen3.8-Flash (via B.AI). O máximo de saída
+// documentado do modelo é 131.072 tokens — ficamos com folga abaixo disso
+// (130K, valor que você já vinha usando) pra não estourar o teto em nenhum
+// request. reasoning_effort aceita low/medium/high (mesmo formato usado
+// antes pro DeepSeek); o Qwen3.8-Flash também suporta preserve_thinking
+// pra manter o raciocínio de rodadas anteriores — não implementado aqui
+// ainda, pode valer a pena olhar se o histórico de tool-calling começar a
+// perder contexto de raciocínio entre chamadas.
 const MAX_TOKENS_STANDARD = 130000;
 const REASONING_EFFORT_STANDARD = 'medium';
 
@@ -289,7 +300,7 @@ function buildSystemPrompt(
 
 
   return (
-  'Você é o Tato 4.1, o agente principal do app Tato IA, executando sobre DeepSeek V4 Pro. ' +
+  'Você é o Tato 4.1, o agente principal do app Tato IA, executando sobre Qwen3.8-Flash. ' +
   'Você opera como agente, não apenas como chatbot. Quando ferramentas estiverem disponíveis, avalie a solicitação e use as ferramentas necessárias antes de responder. ' +
   'Em tarefas de programação e arquivos, atue diretamente pelas ferramentas: inspecione o estado real, crie/edite os arquivos, execute verificações e só finalize quando a tarefa estiver concluída. ' +
   'Nunca entregue projetos grandes ou código completo diretamente no chat quando uma ferramenta de arquivo puder criar o arquivo. Nunca alegue ter executado, testado, pesquisado ou alterado algo sem usar a ferramenta correspondente. ' +
@@ -1081,12 +1092,11 @@ app.post(
     res
   ) {
 
-    const SEEKAI_API_KEY =
-      process.env.SEEKAI_API_KEY ||
-      process.env.SEEK_API_KEY;
+    const BAI_API_KEY =
+      process.env.BAI_API_KEY;
 
 
-    if (!SEEKAI_API_KEY) {
+    if (!BAI_API_KEY) {
       return res
         .status(500)
         .json({
@@ -1094,7 +1104,7 @@ app.post(
             false,
 
           error:
-            'SEEKAI_API_KEY não configurada nas variáveis de ambiente.'
+            'BAI_API_KEY não configurada nas variáveis de ambiente.'
         });
     }
 
@@ -1247,21 +1257,22 @@ app.post(
         ),
 
 
-      // O máximo documentado do DeepSeek V4 Pro é 384K tokens, incluindo
-      // reasoning e saída visível.
+      // Máximo de saída do Qwen3.8-Flash: 131.072 tokens (reasoning + saída
+      // visível somados). Ficamos abaixo disso de propósito (130K).
       max_tokens:
         requestMaxTokens,
 
 
-      // Campos oficiais do DeepSeek V4 para thinking/reasoning.
+      // Controle de raciocínio do Qwen3.8-Flash: low/medium/high.
+      // (Removemos o campo "thinking: {type:'enabled'}" que era específico
+      // do formato do DeepSeek/Anthropic — a B.AI/Qwen não usa esse campo
+      // no endpoint /v1/chat/completions; se o reasoning não vier ativo,
+      // o próximo teste é mandar reasoning_effort dentro de um objeto
+      // "reasoning": { effort: ... } — a doc da B.AI só documenta esse
+      // formato claramente pro endpoint /v1/responses, não pro
+      // /v1/chat/completions.)
       reasoning_effort:
         requestReasoningEffort,
-
-      thinking:
-        {
-          type:
-            'enabled'
-        },
 
 
       stream:
@@ -1342,7 +1353,7 @@ app.post(
 
         upstream =
           await fetch(
-            SEEKAI_ENDPOINT,
+            BAI_ENDPOINT,
             {
               method:
                 'POST',
@@ -1353,7 +1364,7 @@ app.post(
 
                 'Authorization':
                   'Bearer ' +
-                  SEEKAI_API_KEY,
+                  BAI_API_KEY,
 
                 'Accept':
                   'text/event-stream'
@@ -1564,7 +1575,7 @@ app.post(
     let pendingThinking =
       '';
 
-    // O DeepSeek exige reasoning_content completo nas próximas rodadas quando tools estão ativas.
+    // Mantemos reasoning_content completo pras próximas rodadas quando tools estão ativas (mesmo comportamento usado antes pro DeepSeek; o Qwen3.8-Flash tem um campo próprio pra isso, preserve_thinking, que ainda não está implementado aqui).
     let reasoningContentAcc =
       '';
 
@@ -1898,7 +1909,7 @@ app.post(
             {};
 
 
-          // DeepSeek V4 Pro usa reasoning_content no streaming.
+          // Qwen3.8-Flash (via B.AI) usa reasoning_content no streaming.
           // Alguns relays compatíveis podem normalizar o campo para
           // reasoning/reasoning_text, então aceitamos essas variantes sem
           // depender de <think> dentro do conteúdo visível.
