@@ -45,6 +45,7 @@ const TATO_TOOL_POLICY_PROMPT = {
     'Quando um arquivo já existe, não invente seu conteúdo nem reescreva partes que não precisam mudar. Use read_file, list_files, run_command ou edit_file conforme a situação. ' +
     'Para páginas HTML recém-criadas ou alteradas, use test_html_sandbox quando essa verificação fizer sentido; se houver erro real, corrija e teste novamente antes de concluir. ' +
     'Use send_file quando o usuário precisar receber explicitamente um arquivo. ' +
+    'Em tarefas longas com várias ferramentas em sequência, use notes pra anotar plano e progresso em vez de re-investigar tudo do zero a cada rodada — escreva um plano curto no início (notes action="write"), atualize com action="append" depois de cada etapa concluída, e leia com action="read" ao retomar uma tarefa interrompida. Não use notes em tarefas simples de 1-2 passos. ' +
     'Use sleep somente quando uma espera real de 5 a 15 segundos for necessária para sincronização, teste ou sequência temporal; nunca use sleep como decoração. ' +
     'Use read_url quando o usuário fornecer uma URL concreta que precise ser lida; use web_search para descoberta ou informação atual quando essa ferramenta estiver disponível. ' +
     'Use github para consultar diretamente código, repositórios, releases e metadados do GitHub quando a tarefa depender disso. ' +
