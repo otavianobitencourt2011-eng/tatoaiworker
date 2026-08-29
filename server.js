@@ -1247,14 +1247,6 @@ app.post(
         ),
 
 
-      temperature:
-        0.9,
-
-
-      top_p:
-        0.95,
-
-
       // O mÃ¡ximo documentado do DeepSeek V4 Pro Ã© 384K tokens, incluindo
       // reasoning e saÃ­da visÃ­vel.
       max_tokens:
@@ -1808,9 +1800,12 @@ app.post(
             }
           );
 
+        // SSE pode chegar com LF ou CRLF. Normalizamos apenas as quebras
+        // de evento para garantir que reasoning_content/tool_calls sejam
+        // processados em streaming atravÃ©s de relays/proxies diferentes.
+        sseBuffer = sseBuffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
         let idx;
-
 
         while (
           (
@@ -1903,22 +1898,23 @@ app.post(
             {};
 
 
-          // reasoning_content
-          if (
-            typeof
-              delta.reasoning_content ===
-              'string' &&
-            delta.reasoning_content
-          ) {
+          // DeepSeek V4 Pro usa reasoning_content no streaming.
+          // Alguns relays compatÃ­veis podem normalizar o campo para
+          // reasoning/reasoning_text, entÃ£o aceitamos essas variantes sem
+          // depender de <think> dentro do conteÃºdo visÃ­vel.
+          const reasoningPiece =
+            (typeof delta.reasoning_content === 'string' && delta.reasoning_content) ||
+            (typeof delta.reasoning === 'string' && delta.reasoning) ||
+            (typeof delta.reasoning_text === 'string' && delta.reasoning_text) ||
+            '';
 
-            pendingThinking +=
-              delta.reasoning_content;
-
-            reasoningContentAcc +=
-              delta.reasoning_content;
-
-            registerThinking(delta.reasoning_content);
-            scheduleFlush();
+          if (reasoningPiece) {
+            // Para o Tato 4.1, envie cada fragmento de reasoning assim que
+            // chegar. Isso reproduz o comportamento de streaming do Flash.
+            pendingThinking += reasoningPiece;
+            reasoningContentAcc += reasoningPiece;
+            registerThinking(reasoningPiece);
+            flushPending();
           }
 
 
@@ -2096,6 +2092,12 @@ app.post(
       return;
     }
 
+
+    // Processa qualquer texto final que o decoder ainda tenha mantido no buffer.
+    const decoderRemainder = decoder.decode();
+    if (decoderRemainder) {
+      sseBuffer += decoderRemainder.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    }
 
     const leftover =
       think.flushRemainder();
