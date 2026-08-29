@@ -15,7 +15,7 @@ import express from 'express';
 // Tato 4.1 â€” mantÃ©m o mesmo worker legado que antes atendia o Tato 1.1,
 // agora apontando para o gateway SeekAi compatÃ­vel com OpenAI.
 const SEEKAI_ENDPOINT = 'https://seekai.cc/v1/chat/completions';
-const MODEL = 'deepseek-v4-flash';
+const MODEL = 'deepseek-v4-pro';
 const SEEKAI_API_KEY =
   process.env.SEEKAI_API_KEY ||
   process.env.SEEK_API_KEY;
