@@ -12,7 +12,7 @@
 import express from 'express';
 
 const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
-const MODEL = 'moonshotai/kimi-k3';
+const MODEL = 'nvidia/nemotron-3-ultra-550b-a55b';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
