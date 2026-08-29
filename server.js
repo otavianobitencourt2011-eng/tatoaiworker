@@ -327,6 +327,16 @@ function buildSystemPrompt(
 
   '\n\n' +
 
+  'FERRAMENTA notes: em tarefas longas que exigem várias chamadas de ferramenta em sequência (projetos grandes, ' +
+  'refatorações, várias etapas de correção), use a ferramenta notes pra anotar o plano e o progresso em vez de ' +
+  're-ler arquivos ou tentar lembrar de cabeça o que já foi feito. No início de uma tarefa complexa, escreva um ' +
+  'plano curto com notes(action="write"). Depois de cada etapa concluída, atualize com notes(action="append"). Se ' +
+  'a tarefa for retomada (ex: depois de bater o limite de ferramentas por rodada), comece lendo notes(action=' +
+  '"read") em vez de re-investigar tudo do zero. Isso evita repetir trabalho e reduz o número de rodadas ' +
+  'necessárias. Não use notes para tarefas simples de 1 ou 2 passos. ' +
+
+  '\n\n' +
+
   'REGRA DE ARQUITETURA OBRIGATÓRIA: todo projeto web (jogos, sites, apps) deve ser entregue em UM ÚNICO ' +
   'arquivo .html, com todo o CSS dentro de uma tag <style> no <head> e todo o JavaScript dentro de uma tag ' +
   '<script> antes do </body>. NUNCA separe em arquivos .css ou .js externos, mesmo que essa seja a prática ' +
