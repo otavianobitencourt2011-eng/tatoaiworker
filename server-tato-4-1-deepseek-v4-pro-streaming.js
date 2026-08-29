@@ -23,8 +23,8 @@ const FLUSH_MS = 60;
 
 // Tato 4.1 usa DeepSeek V4 Pro. A API aceita low/high/max; medium é
 // aceito por compatibilidade e é mapeado para high. Máximo de saída: 384K.
-const MAX_TOKENS_STANDARD = 384000;
-const REASONING_EFFORT_STANDARD = 'low';
+const MAX_TOKENS_STANDARD = 130000;
+const REASONING_EFFORT_STANDARD = 'medium';
 
 // Limite único de tamanho de arquivo no backend.
 const MAX_FILE_BYTES_STANDARD = 1 * 1024 * 1024;
