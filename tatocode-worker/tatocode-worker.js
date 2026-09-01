@@ -1,10 +1,10 @@
 // tatocode-worker.js
-// Worker do modelo "TatoCode 1.3" — proxy para a API da B.AI (modelo mimo-v2.5).
+// Worker do modelo "TatoCode 1.3" — proxy para a API da B.AI (modelo glm-5.3).
 // Espelha o contrato usado pelo frontend do Tato (mesmo formato de payload e
 // de streaming SSE do worker Flash), então funciona com o mesmo askTato() do
 // HTML sem precisar mudar nada além do model_mode/worker URL.
 //
-// IMPORTANTE: nunca revelar "B.AI" ou "mimo-v2.5" pro usuário final — pra
+// IMPORTANTE: nunca revelar "B.AI" ou "GLM" pro usuário final — pra
 // ele isso é só "TatoCode".
 
 const express = require('express');
@@ -16,7 +16,7 @@ app.use(express.json({ limit: '35mb' }));
 
 const BAI_API_KEY = process.env.BAI_API_KEY; // segredo configurado no Render
 const BAI_BASE_URL = 'https://api.b.ai/v1';
-const BAI_MODEL = 'mimo-v2.5';
+const BAI_MODEL = 'glm-5.3';
 const MAX_TOKENS = 32768; // teto que o mimo-v2.5 aguenta confortavelmente
 
 if (!BAI_API_KEY) {
@@ -86,21 +86,19 @@ app.post('/', async (req, res) => {
     const body = req.body || {};
     const messages = buildMessages(body.messages);
     const tools = Array.isArray(body.tools) && body.tools.length ? body.tools : undefined;
-    const wantsThinking = !!(body.chat_template_kwargs && body.chat_template_kwargs.enable_thinking);
 
     const baiPayload = {
       model: BAI_MODEL,
       messages,
       max_tokens: MAX_TOKENS,
-      stream: true
+      stream: true,
+      // GLM-5.3 não tem raciocínio liga/desliga — é por nível de esforço.
+      // Fixamos em "medium" sempre, sem depender de nenhum botão no front.
+      reasoning: { effort: 'medium', summary: 'auto' }
     };
     if (tools) {
       baiPayload.tools = tools;
       if (body.tool_choice) baiPayload.tool_choice = body.tool_choice;
-    }
-    if (wantsThinking) {
-      // B.AI usa "reasoning" (estilo OpenAI Responses) pra ligar o raciocínio.
-      baiPayload.reasoning = { effort: 'high', summary: 'auto' };
     }
 
     const upstream = await fetch(BAI_BASE_URL + '/chat/completions', {
