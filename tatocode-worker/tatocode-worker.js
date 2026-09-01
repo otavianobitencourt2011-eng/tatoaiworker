@@ -1,5 +1,5 @@
 // tatocode-worker.js
-// Worker do modelo "TatoCode 1.3" — proxy para a API da B.AI (modelo glm-5.3).
+// Worker do modelo "TatoCode 1.3" — proxy para a API da B.AI (modelo glm-5.3-flash).
 // Espelha o contrato usado pelo frontend do Tato (mesmo formato de payload e
 // de streaming SSE do worker Flash), então funciona com o mesmo askTato() do
 // HTML sem precisar mudar nada além do model_mode/worker URL.
@@ -16,7 +16,7 @@ app.use(express.json({ limit: '35mb' }));
 
 const BAI_API_KEY = process.env.BAI_API_KEY; // segredo configurado no Render
 const BAI_BASE_URL = 'https://api.b.ai/v1';
-const BAI_MODEL = 'glm-5.3';
+const BAI_MODEL = 'glm-5.3-flash';
 const MAX_TOKENS = 32768; // teto que o mimo-v2.5 aguenta confortavelmente
 
 if (!BAI_API_KEY) {
@@ -86,19 +86,23 @@ app.post('/', async (req, res) => {
     const body = req.body || {};
     const messages = buildMessages(body.messages);
     const tools = Array.isArray(body.tools) && body.tools.length ? body.tools : undefined;
+    const wantsThinking = !!(body.chat_template_kwargs && body.chat_template_kwargs.enable_thinking);
 
     const baiPayload = {
       model: BAI_MODEL,
       messages,
       max_tokens: MAX_TOKENS,
-      stream: true,
-      // GLM-5.3 não tem raciocínio liga/desliga — é por nível de esforço.
-      // Fixamos em "medium" sempre, sem depender de nenhum botão no front.
-      reasoning: { effort: 'medium', summary: 'auto' }
+      stream: true
     };
     if (tools) {
       baiPayload.tools = tools;
       if (body.tool_choice) baiPayload.tool_choice = body.tool_choice;
+    }
+    if (wantsThinking) {
+      // glm-5.3-flash é chat-completions-only (não usa o "reasoning" por
+      // níveis dos modelos maiores) — o raciocínio liga/desliga via
+      // chat_template_kwargs, igual o antigo Tato 2.9 Flash.
+      baiPayload.chat_template_kwargs = { enable_thinking: true };
     }
 
     const upstream = await fetch(BAI_BASE_URL + '/chat/completions', {
