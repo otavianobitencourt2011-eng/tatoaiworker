@@ -130,58 +130,76 @@ app.post('/', async (req, res) => {
     let buffer = '';
     // Acumula tool_calls parciais (vêm em pedaços via delta.tool_calls)
     const toolCallsAcc = {};
+    let finalTextAcc = '';
+    let sentDone = false;
 
     function sendEvent(obj) {
       res.write('data: ' + JSON.stringify(obj) + '\n\n');
     }
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const dataStr = trimmed.slice(5).trim();
-        if (dataStr === '[DONE]') continue;
-        let chunk;
-        try { chunk = JSON.parse(dataStr); } catch (_) { continue; }
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr === '[DONE]') continue;
+          let chunk;
+          try { chunk = JSON.parse(dataStr); } catch (_) { continue; }
 
-        const choice = chunk.choices && chunk.choices[0];
-        if (!choice) continue;
-        const delta = choice.delta || {};
+          const choice = chunk.choices && chunk.choices[0];
+          if (!choice) continue;
+          const delta = choice.delta || {};
 
-        if (typeof delta.content === 'string' && delta.content) {
-          sendEvent({ delta: delta.content });
-        }
-        // Raciocínio (thinking) — B.AI manda em delta.reasoning ou
-        // delta.reasoning_content dependendo do modelo; cobrimos ambos.
-        const reasoningPiece = delta.reasoning_content || delta.reasoning;
-        if (typeof reasoningPiece === 'string' && reasoningPiece) {
-          sendEvent({ thinking: reasoningPiece });
-        }
-        if (Array.isArray(delta.tool_calls)) {
-          for (const tc of delta.tool_calls) {
-            const idx = tc.index != null ? tc.index : 0;
-            if (!toolCallsAcc[idx]) {
-              toolCallsAcc[idx] = { id: tc.id || ('call_' + idx), type: 'function', function: { name: '', arguments: '' } };
+          if (typeof delta.content === 'string' && delta.content) {
+            finalTextAcc += delta.content;
+            sendEvent({ type: 'delta', text: delta.content });
+          }
+          // Raciocínio (thinking) — B.AI manda em delta.reasoning ou
+          // delta.reasoning_content dependendo do modelo; cobrimos ambos.
+          const reasoningPiece = delta.reasoning_content || delta.reasoning;
+          if (typeof reasoningPiece === 'string' && reasoningPiece) {
+            sendEvent({ type: 'thinking', text: reasoningPiece });
+          }
+          if (Array.isArray(delta.tool_calls)) {
+            for (const tc of delta.tool_calls) {
+              const idx = tc.index != null ? tc.index : 0;
+              if (!toolCallsAcc[idx]) {
+                toolCallsAcc[idx] = { id: tc.id || ('call_' + idx), type: 'function', function: { name: '', arguments: '' } };
+              }
+              if (tc.id) toolCallsAcc[idx].id = tc.id;
+              if (tc.function && tc.function.name) toolCallsAcc[idx].function.name += tc.function.name;
+              if (tc.function && tc.function.arguments) toolCallsAcc[idx].function.arguments += tc.function.arguments;
+              sendEvent({ type: 'tool_delta', index: idx, function: tc.function || {} });
             }
-            if (tc.id) toolCallsAcc[idx].id = tc.id;
-            if (tc.function && tc.function.name) toolCallsAcc[idx].function.name += tc.function.name;
-            if (tc.function && tc.function.arguments) toolCallsAcc[idx].function.arguments += tc.function.arguments;
+          }
+          if (choice.finish_reason) {
+            const hasToolCalls = Object.keys(toolCallsAcc).length > 0;
+            const finalMessage = hasToolCalls
+              ? { role: 'assistant', content: finalTextAcc || null, tool_calls: Object.keys(toolCallsAcc).sort().map(function (k) { return toolCallsAcc[k]; }) }
+              : { role: 'assistant', content: finalTextAcc };
+            sendEvent({ type: 'done', message: finalMessage });
+            sentDone = true;
           }
         }
-        if (choice.finish_reason === 'tool_calls' || (choice.finish_reason && Object.keys(toolCallsAcc).length)) {
-          const finalToolCalls = Object.keys(toolCallsAcc).sort().map(function (k) { return toolCallsAcc[k]; });
-          sendEvent({ message: { role: 'assistant', content: null, tool_calls: finalToolCalls } });
-        }
       }
+
+      if (!sentDone) {
+        // O upstream fechou sem mandar finish_reason — ainda assim devolve
+        // o texto que já foi acumulado, pra não travar o frontend.
+        sendEvent({ type: 'done', message: { role: 'assistant', content: finalTextAcc } });
+      }
+    } catch (streamErr) {
+      console.error('[TatoCode] Erro durante o streaming:', streamErr);
+      sendEvent({ type: 'error', error: String(streamErr && streamErr.message || streamErr) });
     }
 
-    res.write('data: [DONE]\n\n');
     res.end();
   } catch (err) {
     console.error('[TatoCode] Erro no worker:', err);
