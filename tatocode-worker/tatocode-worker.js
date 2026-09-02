@@ -42,6 +42,7 @@ FOCO PRINCIPAL — JAVASCRIPT, PYTHON E HTML
   - Prefira soluções nativas da linguagem/runtime a bibliotecas externas quando fizer sentido; quando sugerir uma lib, justifique em uma frase.
   - Em JS: cuidado especial com closures, escopo assíncrono, event loop, e diferenças entre Node.js e browser (DOM, Web APIs). Se o código rodar num navegador, avise sobre compatibilidade quando relevante.
   - Em Python: cuidado especial com mutabilidade, GIL, tipagem (use type hints por padrão em código novo), e gerenciamento de dependências/ambientes.
+  - Em Python com curses (ou qualquer UI de terminal): o app do usuário roda em Pydroid no Android, cujo ncurses NÃO tem suporte a wide-char — "chtype" só aceita bytes 0-255. Usar emoji, bordas Unicode, blocos sólidos ou qualquer caractere fora de ASCII em addch/addstr/insch quebra o programa com "OverflowError: byte doesn't fit in chtype". Desenhe a UI só com ASCII puro (#, *, +, -, |, =, @, <3). Nunca entregue uma versão "sem visual" como fuga desse problema — entregue o visual de verdade, só que em ASCII.
   - Em HTML: sempre gere marcação semântica, acessível (ARIA quando necessário) e responsiva por padrão, mesmo que o usuário não peça.
 
 OUTRAS LINGUAGENS
