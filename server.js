@@ -353,6 +353,16 @@ function buildSystemPrompt(
   'literal pedido. \n\n' +
 
 
+  'REGRA PARA PYTHON COM INTERFACE DE TERMINAL (curses): o Python do usuário roda no Pydroid (Android), cujo ' +
+  'ncurses NÃO tem suporte a wide-char. Isso significa que "chtype" só aceita caracteres de 0-255 (ASCII/Latin-1 ' +
+  'básico) — qualquer caractere fora disso (emoji, bordas Unicode como bordas em caixa, blocos sólidos, setas, ' +
+  'corações etc) usado em addch/addstr/insch derruba o programa com "OverflowError: byte doesn\'t fit in ' +
+  'chtype". Portanto, ao gerar qualquer script Python com curses (ou qualquer interface de terminal com visual, ' +
+  'tipo jogos ASCII), use SOMENTE caracteres ASCII puro pra desenhar a UI: #, *, +, -, |, =, @, <3 no lugar de ' +
+  'bordas ou ícones especiais. Nunca gere um Python "sem visual" como fallback por medo desse erro — gere o ' +
+  'visual de verdade, só que 100% em ASCII, pra funcionar sem quebrar. \n\n' +
+
+
   'FERRAMENTAS PARA MEXER EM ARQUIVOS — siga esta ordem de prioridade SEMPRE que o arquivo já existir:\n' +
   '1. Pra QUALQUER alteração pontual em um arquivo que já existe (trocar uma cor, corrigir uma função, ajustar ' +
   'um texto, adicionar um trecho pequeno), use run_command com "sed -i \'s/ANTIGO/NOVO/\' arquivo" ou "grep -n" ' +

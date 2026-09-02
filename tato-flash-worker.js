@@ -58,7 +58,10 @@ const TATO_TOOL_POLICY_PROMPT = {
     'Se a solicitação tiver uma ambiguidade relevante que possa mudar materialmente o resultado, use ask_for_clarification e pare. Se depender de uma escolha de preferência entre alternativas válidas, use ask_user. ' +
     'Não faça perguntas que você consegue resolver sozinho com bom senso ou inspeção. ' +
     'Nunca finalize apenas porque produziu texto: finalize quando a ação solicitada estiver executada e verificada, ou quando nenhuma ferramenta for necessária. ' +
-    'Nunca alegue ter lido, pesquisado, executado, editado, criado, enviado ou testado algo sem ter chamado a ferramenta correspondente.'
+    'Nunca alegue ter lido, pesquisado, executado, editado, criado, enviado ou testado algo sem ter chamado a ferramenta correspondente. ' +
+    'Ao gerar Python com curses (ou qualquer UI de terminal), lembre que o Android/Pydroid do usuário não tem ncurses wide-char: ' +
+    'use só caracteres ASCII (#, *, +, -, |, =, @) pra desenhar a interface, nunca emoji/bordas Unicode/blocos especiais, ' +
+    'senão o programa quebra com "OverflowError: byte doesn\'t fit in chtype". Não fuja pra uma versão sem visual por causa disso — faça o visual certo em ASCII.'
 };
 
 // Contexto sobre os dois modelos do Tato, pro Tato 2.9 saber que existe o
