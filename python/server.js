@@ -6,6 +6,26 @@ const ONLINECOMPILER_API_KEY = process.env.ONLINECOMPILER_API_KEY;
 const TATO_WORKER_TOKEN = process.env.TATO_WORKER_TOKEN;
 
 app.disable('x-powered-by');
+
+/*
+ * CORS
+ * O navegador faz um preflight OPTIONS antes do POST /execute
+ * por causa do Content-Type e, eventualmente, do Authorization.
+ * O preflight precisa ser respondido antes da autenticação e da rota.
+ */
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Max-Age', '86400');
+
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+
+  next();
+});
+
 app.use(express.json({ limit: '150kb' }));
 
 function requireWorkerToken(req, res, next) {
@@ -67,18 +87,21 @@ app.post('/execute', requireWorkerToken, async (req, res) => {
   }
 
   try {
-    const response = await fetch('https://api.onlinecompiler.io/api/run-code-sync/', {
-      method: 'POST',
-      headers: {
-        'Authorization': ONLINECOMPILER_API_KEY,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ compiler, code, input })
-    });
+    const response = await fetch(
+      'https://api.onlinecompiler.io/api/run-code-sync/',
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': ONLINECOMPILER_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ compiler, code, input })
+      }
+    );
 
     const text = await response.text();
-    let data;
 
+    let data;
     try {
       data = JSON.parse(text);
     } catch {
@@ -95,9 +118,10 @@ app.post('/execute', requireWorkerToken, async (req, res) => {
     return res.status(200).json(data);
   } catch (error) {
     console.error('OnlineCompiler error:', error);
+
     return res.status(502).json({
       error: 'Failed to reach OnlineCompiler.',
-      details: error.message
+      details: error instanceof Error ? error.message : String(error)
     });
   }
 });
