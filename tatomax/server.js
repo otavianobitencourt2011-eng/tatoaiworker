@@ -6,7 +6,7 @@ const PORT = process.env.PORT || 10000;
 
 // UnoRouter documenta o ID oficial como claude-opus-4-8.
 // A variante :free é usada aqui exatamente como solicitada para o canal gratuito.
-const MODEL = 'claude-opus-4-8:free';
+const MODEL = 'claude-opus-4.8:free';
 const API_URL = 'https://api.unorouter.com/v1/chat/completions';
 const MAX_OUTPUT_TOKENS = 128000;
 const REASONING_EFFORT = 'medium';
