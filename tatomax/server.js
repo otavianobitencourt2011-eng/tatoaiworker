@@ -11,7 +11,7 @@ const API_URL = 'https://api.unorouter.com/v1/images/generations';
 // gpt-image-2:free Ã© listado pelo UnoRouter como um modelo de image_generation
 // com endpoint compatÃ­vel com OpenAI e preÃ§o $0.00/$0.00.
 const DEFAULT_SIZE = process.env.IMAGE_SIZE || '1024x1024';
-const DEFAULT_QUALITY = process.env.IMAGE_QUALITY || 'high';
+const DEFAULT_QUALITY = process.env.IMAGE_QUALITY || 'auto';
 const DEFAULT_N = Math.min(Math.max(Number(process.env.IMAGE_N || 1), 1), 8);
 
 app.use(cors({
@@ -139,8 +139,7 @@ app.post('/', async (req, res) => {
     prompt,
     n,
     size,
-    quality,
-    response_format: 'b64_json'
+    quality
   };
 
   let upstream;
