@@ -4,12 +4,15 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// UnoRouter documenta o ID oficial como claude-opus-4-8.
-// A variante :free é usada aqui exatamente como solicitada para o canal gratuito.
-const MODEL = 'claude-opus-4.8:free';
-const API_URL = 'https://api.unorouter.com/v1/chat/completions';
-const MAX_OUTPUT_TOKENS = 128000;
-const REASONING_EFFORT = 'medium';
+// Tato-5m: modelo dedicado Ã  geraÃ§Ã£o de imagens no UnoRouter.
+const MODEL = 'gpt-image-2:free';
+const API_URL = 'https://api.unorouter.com/v1/images/generations';
+
+// gpt-image-2:free Ã© listado pelo UnoRouter como um modelo de image_generation
+// com endpoint compatÃ­vel com OpenAI e preÃ§o $0.00/$0.00.
+const DEFAULT_SIZE = process.env.IMAGE_SIZE || '1024x1024';
+const DEFAULT_QUALITY = process.env.IMAGE_QUALITY || 'high';
+const DEFAULT_N = Math.min(Math.max(Number(process.env.IMAGE_N || 1), 1), 8);
 
 app.use(cors({
   origin: true,
@@ -20,28 +23,33 @@ app.use(express.json({ limit: '20mb' }));
 
 function extractText(value) {
   if (typeof value === 'string') return value;
+
   if (Array.isArray(value)) {
     return value.map((part) => {
       if (typeof part === 'string') return part;
       if (!part || typeof part !== 'object') return '';
-      return part.text || part.content || part.value || '';
+      return part.text || part.content || part.value || part.prompt || '';
     }).join('');
   }
+
   if (value && typeof value === 'object') {
-    return value.text || value.content || value.value || '';
+    return value.text || value.content || value.value || value.prompt || '';
   }
+
   return '';
 }
 
 function getErrorMessage(payload, fallback = 'Erro desconhecido no UnoRouter.') {
   if (!payload) return fallback;
   if (typeof payload === 'string') return payload;
+
   if (payload.error) {
     if (typeof payload.error === 'string') return payload.error;
     if (typeof payload.error === 'object') {
       return payload.error.message || payload.error.detail || payload.error.code || JSON.stringify(payload.error);
     }
   }
+
   return payload.message || payload.detail || payload.reason || fallback;
 }
 
@@ -49,112 +57,103 @@ function sendSse(res, event) {
   res.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-function normalizeToolCall(call) {
-  if (!call || typeof call !== 'object') return null;
-  const fn = call.function || {};
-  return {
-    id: call.id || '',
-    type: call.type || 'function',
-    function: {
-      name: fn.name || '',
-      arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments || {})
-    }
-  };
-}
+function getPrompt(body) {
+  if (typeof body.prompt === 'string' && body.prompt.trim()) {
+    return body.prompt.trim();
+  }
 
-function getReasoningText(delta, choice) {
-  const candidates = [
-    delta && delta.reasoning,
-    delta && delta.reasoning_content,
-    delta && delta.reasoning_summary,
-    delta && delta.thinking,
-    choice && choice.reasoning,
-    choice && choice.reasoning_content,
-    choice && choice.reasoning_summary,
-    choice && choice.thinking
-  ];
+  if (!Array.isArray(body.messages)) return '';
 
-  for (const candidate of candidates) {
-    const text = extractText(candidate);
+  // Pega a Ãºltima mensagem do usuÃ¡rio para manter compatibilidade com o
+  // formato que o frontend do Tato jÃ¡ envia para os outros workers.
+  for (let i = body.messages.length - 1; i >= 0; i--) {
+    const message = body.messages[i];
+    if (!message || message.role !== 'user') continue;
+
+    const text = extractText(message.content).trim();
     if (text) return text;
   }
+
   return '';
 }
 
-function collectReasoningFromMessage(message) {
-  if (!message) return '';
-  return extractText(
-    message.reasoning ||
-    message.reasoning_content ||
-    message.reasoning_summary ||
-    message.thinking ||
-    ''
-  );
-}
+function getImageOptions(body) {
+  const size = typeof body.size === 'string' && body.size.trim()
+    ? body.size.trim()
+    : DEFAULT_SIZE;
 
-function buildUpstreamBody(body) {
-  const upstream = {
-    model: MODEL,
-    messages: Array.isArray(body.messages) ? body.messages : [],
-    stream: true,
-    reasoning_effort: REASONING_EFFORT,
-    include_reasoning: true,
-    max_tokens: MAX_OUTPUT_TOKENS
-  };
+  const quality = typeof body.quality === 'string' && body.quality.trim()
+    ? body.quality.trim()
+    : DEFAULT_QUALITY;
 
-  // O sistema do Tato envia as mesmas ferramentas para os workers.
-  // O Tato Max simplesmente repassa essas tools ao UnoRouter.
-  if (Array.isArray(body.tools) && body.tools.length) upstream.tools = body.tools;
-  if (body.tool_choice !== undefined) upstream.tool_choice = body.tool_choice;
-  if (body.response_format !== undefined) upstream.response_format = body.response_format;
-  if (body.temperature !== undefined) upstream.temperature = body.temperature;
-  if (body.top_p !== undefined) upstream.top_p = body.top_p;
+  const nValue = Number(body.n ?? DEFAULT_N);
+  const n = Number.isFinite(nValue)
+    ? Math.min(Math.max(Math.floor(nValue), 1), 8)
+    : DEFAULT_N;
 
-  return upstream;
+  return { size, quality, n };
 }
 
 app.get('/', (_req, res) => {
   res.json({
     ok: true,
-    worker: 'tato-max',
+    worker: 'tato-5m',
     model: MODEL,
     provider: 'UnoRouter',
-    reasoning: REASONING_EFFORT,
-    max_tokens: MAX_OUTPUT_TOKENS,
-    context_window: 1000000,
-    streaming: true,
-    tools: true
+    mode: 'image_generation',
+    endpoint: API_URL,
+    size: DEFAULT_SIZE,
+    quality: DEFAULT_QUALITY,
+    max_images_per_request: 8
   });
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, model: MODEL });
+  res.json({ ok: true, model: MODEL, mode: 'image_generation' });
 });
 
 app.post('/', async (req, res) => {
   const apiKey = process.env.UNOROUTER_API_KEY;
+
   if (!apiKey) {
     return res.status(500).json({
       ok: false,
-      error: 'UNOROUTER_API_KEY não configurada no Render.'
+      error: 'UNOROUTER_API_KEY nÃ£o configurada no Render.'
     });
   }
 
   const body = req.body || {};
-  if (!Array.isArray(body.messages) || !body.messages.length) {
-    return res.status(400).json({ ok: false, error: 'messages é obrigatório.' });
+  const prompt = getPrompt(body);
+
+  if (!prompt) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Envie um prompt em "prompt" ou uma mensagem de usuÃ¡rio em "messages".'
+    });
   }
 
+  const { size, quality, n } = getImageOptions(body);
+
+  const upstreamBody = {
+    model: MODEL,
+    prompt,
+    n,
+    size,
+    quality,
+    response_format: 'b64_json'
+  };
+
   let upstream;
+
   try {
     upstream = await fetch(API_URL, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
-        'Accept': 'text/event-stream'
+        'Accept': 'application/json'
       },
-      body: JSON.stringify(buildUpstreamBody(body))
+      body: JSON.stringify(upstreamBody)
     });
   } catch (error) {
     return res.status(502).json({
@@ -163,10 +162,11 @@ app.post('/', async (req, res) => {
     });
   }
 
+  const raw = await upstream.text().catch(() => '');
+  let payload = null;
+  try { payload = raw ? JSON.parse(raw) : null; } catch (_) {}
+
   if (!upstream.ok) {
-    const raw = await upstream.text().catch(() => '');
-    let payload = null;
-    try { payload = raw ? JSON.parse(raw) : null; } catch (_) {}
     return res.status(upstream.status).json({
       ok: false,
       error: getErrorMessage(payload, raw || `UnoRouter HTTP ${upstream.status}`),
@@ -174,10 +174,18 @@ app.post('/', async (req, res) => {
     });
   }
 
-  if (!upstream.body) {
-    return res.status(502).json({ ok: false, error: 'UnoRouter respondeu sem corpo.' });
+  const images = Array.isArray(payload?.data) ? payload.data : [];
+
+  if (!images.length) {
+    return res.status(502).json({
+      ok: false,
+      error: 'O UnoRouter respondeu sem imagens.',
+      upstream_response: payload || raw
+    });
   }
 
+  // Mantemos o mesmo contrato SSE dos outros workers do Tato para que o
+  // frontend existente consiga consumir o resultado sem trocar o fluxo.
   res.status(200);
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -185,169 +193,52 @@ app.post('/', async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let finalContent = '';
-  let finalReasoning = '';
-  const toolCalls = new Map();
-  let finishReason = null;
-  let sentDone = false;
+  const imageUrls = [];
 
-  function mergeToolDelta(index, deltaTool) {
-    const idx = Number.isInteger(index) ? index : 0;
-    const existing = toolCalls.get(idx) || {
-      id: '',
-      type: 'function',
-      function: { name: '', arguments: '' }
-    };
-
-    if (deltaTool.id) existing.id = deltaTool.id;
-    if (deltaTool.type) existing.type = deltaTool.type;
-    if (deltaTool.function) {
-      if (deltaTool.function.name) existing.function.name += deltaTool.function.name;
-      if (typeof deltaTool.function.arguments === 'string') existing.function.arguments += deltaTool.function.arguments;
+  for (const item of images) {
+    if (item?.url) {
+      imageUrls.push(item.url);
+      continue;
     }
 
-    toolCalls.set(idx, existing);
-    return existing;
+    if (item?.b64_json) {
+      imageUrls.push(`data:image/png;base64,${item.b64_json}`);
+    }
   }
 
-  function processProviderObject(obj) {
-    if (!obj) return;
-    if (obj.error) {
-      sendSse(res, { type: 'error', error: getErrorMessage(obj) });
-      return;
-    }
-
-    const choices = Array.isArray(obj.choices) ? obj.choices : [];
-    if (!choices.length) {
-      // Alguns gateways devolvem uma mensagem completa em vez de choices delta.
-      const msg = obj.message || obj;
-      const reasoning = collectReasoningFromMessage(msg);
-      if (reasoning) {
-        finalReasoning += reasoning;
-        sendSse(res, { type: 'thinking', text: reasoning });
-      }
-      const content = extractText(msg.content || obj.content || obj.reply || '');
-      if (content) {
-        finalContent += content;
-        sendSse(res, { type: 'delta', text: content });
-      }
-      if (Array.isArray(msg.tool_calls)) {
-        msg.tool_calls.forEach((call, i) => {
-          const normalized = normalizeToolCall(call);
-          if (!normalized) return;
-          toolCalls.set(i, normalized);
-          sendSse(res, {
-            type: 'tool_delta',
-            index: i,
-            name: normalized.function.name,
-            arguments: normalized.function.arguments
-          });
-        });
-      }
-      return;
-    }
-
-    const choice = choices[0] || {};
-    const delta = choice.delta || choice.message || {};
-
-    const reasoning = getReasoningText(delta, choice);
-    if (reasoning) {
-      finalReasoning += reasoning;
-      sendSse(res, { type: 'thinking', text: reasoning });
-    }
-
-    const content = extractText(delta.content);
-    if (content) {
-      finalContent += content;
-      sendSse(res, { type: 'delta', text: content });
-    }
-
-    const deltas = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
-    for (const toolDelta of deltas) {
-      const idx = Number.isInteger(toolDelta.index) ? toolDelta.index : 0;
-      const merged = mergeToolDelta(idx, toolDelta);
-      sendSse(res, {
-        type: 'tool_delta',
-        index: idx,
-        name: merged.function.name,
-        arguments: toolDelta.function && typeof toolDelta.function.arguments === 'string'
-          ? toolDelta.function.arguments
-          : ''
-      });
-    }
-
-    if (choice.finish_reason) finishReason = choice.finish_reason;
-  }
-
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      let boundary;
-      while ((boundary = buffer.indexOf('\n\n')) !== -1) {
-        const rawEvent = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-
-        const dataLines = rawEvent
-          .split(/\r?\n/)
-          .filter((line) => line.startsWith('data:'))
-          .map((line) => line.slice(5).trim());
-
-        for (const data of dataLines) {
-          if (!data || data === '[DONE]') continue;
-          let parsed;
-          try { parsed = JSON.parse(data); } catch (_) { continue; }
-          processProviderObject(parsed);
-        }
-      }
-    }
-
-    // Tenta processar um último evento sem \n\n, caso o gateway finalize assim.
-    const trailing = buffer.trim();
-    if (trailing.startsWith('data:')) {
-      const data = trailing.slice(5).trim();
-      if (data && data !== '[DONE]') {
-        try { processProviderObject(JSON.parse(data)); } catch (_) {}
-      }
-    }
-
-    const message = {
-      role: 'assistant',
-      content: finalContent,
-      tool_calls: Array.from(toolCalls.entries())
-        .sort((a, b) => a[0] - b[0])
-        .map(([, call]) => normalizeToolCall(call))
-        .filter(Boolean)
-    };
-
-    if (!message.tool_calls.length) delete message.tool_calls;
-    if (finalReasoning) message.reasoning_summary = finalReasoning;
-
+  if (!imageUrls.length) {
     sendSse(res, {
-      type: 'done',
-      message,
-      finish_reason: finishReason,
-      limitReached: finishReason === 'length',
-      reasoningCheckpoint: false
+      type: 'error',
+      error: 'O UnoRouter retornou itens de imagem sem URL ou b64_json.'
     });
-    sentDone = true;
-  } catch (error) {
-    sendSse(res, { type: 'error', error: error.message || String(error) });
-  } finally {
-    if (!sentDone) {
-      try { sendSse(res, { type: 'error', error: 'A conexão com o UnoRouter foi encerrada antes da conclusão.' }); } catch (_) {}
-    }
     res.end();
+    return;
   }
+
+  // Uma imagem por bloco markdown. O renderer atual do Tato pode exibir
+  // markdown/data URLs e continua recebendo o evento final "done".
+  const content = imageUrls
+    .map((url, index) => `![Imagem gerada ${index + 1}](${url})`)
+    .join('\n\n');
+
+  sendSse(res, { type: 'delta', text: content });
+  sendSse(res, {
+    type: 'done',
+    message: {
+      role: 'assistant',
+      content,
+      images: imageUrls
+    },
+    finish_reason: 'stop',
+    limitReached: false,
+    reasoningCheckpoint: false
+  });
+
+  res.end();
 });
 
 app.listen(PORT, () => {
-  console.log(`[Tato Max] Worker ouvindo na porta ${PORT}`);
-  console.log(`[Tato Max] Modelo: ${MODEL}`);
-  console.log(`[Tato Max] Reasoning: ${REASONING_EFFORT} | max_tokens: ${MAX_OUTPUT_TOKENS}`);
+  console.log(`[Tato-5m] Worker ouvindo na porta ${PORT}`);
+  console.log(`[Tato-5m] Modelo: ${MODEL}`);
+  console.log(`[Tato-5m] Modo: image_generation`);
 });
