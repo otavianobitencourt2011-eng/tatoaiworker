@@ -16464,6 +16464,26 @@ function agentWithTimeout(promise, timeoutMs, label) {
 }
 __name(agentWithTimeout, "agentWithTimeout");
 
+// Workaround for the Wrangler/esbuild keep-names helper leaking into
+// Puppeteer page-evaluate callbacks. The old bundled Puppeteer serializes
+// callbacks into the browser context, where __name may otherwise be missing.
+async function installPageEvalShim(page) {
+  await agentWithTimeout(
+    page.evaluate(`(() => {
+      if (typeof globalThis.__name !== "function") {
+        globalThis.__name = (target, value) => {
+          try { Object.defineProperty(target, "name", { value, configurable: true }); } catch (_) {}
+          return target;
+        };
+      }
+      return true;
+    })()`),
+    8000,
+    "install_eval_shim"
+  );
+}
+__name(installPageEvalShim, "installPageEvalShim");
+
 async function getOrCreateSession(env, browserSessionId) {
   let browser = null;
   let reconnectError = null;
@@ -16502,6 +16522,9 @@ async function getOrCreateSession(env, browserSessionId) {
   }
   try {
     await agentWithTimeout(page.setViewport({ width: 1280, height: 800 }), 5000, "setViewport");
+  } catch (_) {}
+  try {
+    await installPageEvalShim(page);
   } catch (_) {}
 
   return {
@@ -16675,6 +16698,7 @@ async function handleAgentRequest(request, env, url) {
           30000,
           "open"
         );
+        await installPageEvalShim(page);
         return jsonResponse({
           ok: true,
           action,
@@ -16688,10 +16712,12 @@ async function handleAgentRequest(request, env, url) {
         });
       }
       case "click": {
+        await installPageEvalShim(page);
         await agentWithTimeout(page.click(String(body.selector || ""), { timeout: 10000 }), 12000, "click");
         return jsonResponse({ ok: true, action, selector: body.selector, browser_session_id: actualBrowserSessionId, url: page.url() });
       }
       case "fill": {
+        await installPageEvalShim(page);
         const selector = String(body.selector || "");
         const text = String(body.text == null ? "" : body.text);
         await agentWithTimeout(page.focus(selector), 8000, "fill focus");
@@ -16704,16 +16730,19 @@ async function handleAgentRequest(request, env, url) {
         return jsonResponse({ ok: true, action, selector, browser_session_id: actualBrowserSessionId });
       }
       case "press_key": {
+        await installPageEvalShim(page);
         const selector = String(body.selector || "");
         await agentWithTimeout(page.focus(selector), 8000, "press_key focus");
         await agentWithTimeout(page.keyboard.press(String(body.key || "Enter")), 8000, "press_key");
         return jsonResponse({ ok: true, action, selector, key: body.key, browser_session_id: actualBrowserSessionId, url: page.url() });
       }
       case "scroll_by": {
+        await installPageEvalShim(page);
         await agentWithTimeout(page.evaluate((dx, dy) => window.scrollBy(dx, dy), Number(body.dx) || 0, Number(body.dy) || 400), 8000, "scroll_by");
         return jsonResponse({ ok: true, action, browser_session_id: actualBrowserSessionId });
       }
       case "scroll_to": {
+        await installPageEvalShim(page);
         const selector = String(body.selector || "");
         await agentWithTimeout(page.evaluate((sel) => {
           const el = document.querySelector(sel);
@@ -16723,6 +16752,7 @@ async function handleAgentRequest(request, env, url) {
         return jsonResponse({ ok: true, action, selector, browser_session_id: actualBrowserSessionId });
       }
       case "get_text": {
+        await installPageEvalShim(page);
         const selector = String(body.selector || "body");
         const text = await agentWithTimeout(page.evaluate((sel) => {
           const el = document.querySelector(sel);
@@ -16735,11 +16765,13 @@ async function handleAgentRequest(request, env, url) {
         return jsonResponse({ ok: true, action, selector, text, browser_session_id: actualBrowserSessionId, url: page.url(), title: await page.title() });
       }
       case "get_html": {
+        await installPageEvalShim(page);
         const selector = String(body.selector || "html");
         const html = await agentWithTimeout(page.evaluate((sel) => document.querySelector(sel)?.innerHTML || "", selector), 15000, "get_html");
         return jsonResponse({ ok: true, action, selector, html, browser_session_id: actualBrowserSessionId, url: page.url(), title: await page.title() });
       }
       case "eval_js": {
+        await installPageEvalShim(page);
         const script = String(body.script || "").trim();
         if (!script) throw new Error("O parâmetro script está vazio.");
         // IMPORTANT: execute the script in the remote PAGE context, not in the Worker.
@@ -16747,6 +16779,7 @@ async function handleAgentRequest(request, env, url) {
         return jsonResponse({ ok: true, action, result, browser_session_id: actualBrowserSessionId, url: page.url(), title: await page.title() });
       }
       case "screenshot": {
+        await installPageEvalShim(page);
         const buf = await agentWithTimeout(
           page.screenshot({ fullPage: body.full_page !== false, encoding: "base64" }),
           20000,
@@ -16755,6 +16788,7 @@ async function handleAgentRequest(request, env, url) {
         return jsonResponse({ ok: true, action, image_base64: buf, browser_session_id: actualBrowserSessionId, url: page.url(), title: await page.title() });
       }
       case "describe_state": {
+        await installPageEvalShim(page);
         const state = await agentWithTimeout(describeState(page), 15000, "describe_state");
         return jsonResponse({ ok: true, action, browser_session_id: actualBrowserSessionId, ...state });
       }
