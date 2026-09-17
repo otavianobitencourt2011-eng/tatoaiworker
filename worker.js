@@ -16487,19 +16487,55 @@ __name(installPageEvalShim, "installPageEvalShim");
 async function getOrCreateSession(env, browserSessionId) {
   let browser = null;
   let reconnectError = null;
+  let selectedSessionId = String(browserSessionId || "").trim();
 
-  if (browserSessionId) {
+  // 1) Reconnect to the session explicitly remembered by the frontend.
+  if (selectedSessionId) {
     try {
       browser = await agentWithTimeout(
-        puppeteer_cloudflare_default.connect(env.MYBROWSER, browserSessionId),
+        puppeteer_cloudflare_default.connect(env.MYBROWSER, selectedSessionId),
         15000,
         "connect"
       );
     } catch (err) {
       reconnectError = err;
+      browser = null;
     }
   }
 
+  // 2) If there is no usable remembered session, reuse ANY free Browser Run session.
+  // This avoids creating a new browser on every worker invocation and hitting the
+  // Browser Run acquisition rate limit (especially on Workers Free).
+  if (!browser) {
+    try {
+      const activeSessions = await agentWithTimeout(
+        puppeteer_cloudflare_default.sessions(env.MYBROWSER),
+        8000,
+        "sessions"
+      );
+      const free = Array.isArray(activeSessions)
+        ? activeSessions.filter((item) => item && !item.connectionId && item.sessionId)
+        : [];
+      if (free.length) {
+        const candidate = free[0].sessionId;
+        try {
+          browser = await agentWithTimeout(
+            puppeteer_cloudflare_default.connect(env.MYBROWSER, candidate),
+            15000,
+            "connect free session"
+          );
+          selectedSessionId = candidate;
+        } catch (err) {
+          reconnectError = err;
+          browser = null;
+        }
+      }
+    } catch (err) {
+      reconnectError = err;
+    }
+  }
+
+  // 3) Only launch a NEW browser when there is genuinely no reusable session.
   let launched = false;
   if (!browser) {
     browser = await agentWithTimeout(
