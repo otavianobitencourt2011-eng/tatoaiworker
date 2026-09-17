@@ -455,18 +455,15 @@ export default {
     if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }), origin);
 
     const url = new URL(request.url);
-
-    // --- Rotas do agente de navegador (Browser Run / Puppeteer) ---
-    // Protegidas pelo mesmo login Firebase das rotas de conector.
-    if (url.pathname.startsWith("/agent/")) {
-      const agentUid = await requireUser(request, env);
-      if (!agentUid) return cors(json({ error: "unauthorized" }, 401), origin);
-      return cors(await handleAgentRequest(request, env, url), origin);
-    }
-
     const parts = url.pathname.split("/").filter(Boolean);
 
     try {
+      // Rotas de automação de navegador (agent.js) — não exigem login
+      // Firebase, usam session_id simples no corpo da requisição.
+      if (url.pathname.startsWith("/agent/")) {
+        return cors(await handleAgentRequest(request, env, url), origin);
+      }
+
       if (parts[0] === "internal" && parts[1] === "token" && request.method === "GET") {
         return cors(await internalGetToken(request, env), origin);
       }
