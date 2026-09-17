@@ -16553,15 +16553,15 @@ function escapeCss(value) {
 __name(escapeCss, "escapeCss");
 
 async function describeState(page) {
-  const elements = await page.evaluate((maxEl) => {
-    function uniqueSelector(el) {
+  const state = await page.evaluate(`(maxEl) => {
+    const uniqueSelector = (el) => {
       if (el.id) return "#" + CSS.escape(el.id);
       const tag = el.tagName.toLowerCase();
       const attrs = ["name", "aria-label", "placeholder", "title", "type", "role"];
       for (const attr of attrs) {
         const value = el.getAttribute(attr);
         if (!value) continue;
-        const selector = `${tag}[${attr}="${CSS.escape(value)}"]`;
+        const selector = tag + "[" + attr + '="' + CSS.escape(value) + '"]';
         try {
           if (document.querySelectorAll(selector).length === 1) return selector;
         } catch (_) {}
@@ -16573,7 +16573,7 @@ async function describeState(page) {
         const parent = cur.parentElement;
         if (parent) {
           const same = Array.from(parent.children).filter((child) => child.tagName === cur.tagName);
-          if (same.length > 1) part += `:nth-of-type(${same.indexOf(cur) + 1})`;
+          if (same.length > 1) part += ":nth-of-type(" + (same.indexOf(cur) + 1) + ")";
         }
         path.unshift(part);
         const candidate = path.join(" > ");
@@ -16583,7 +16583,7 @@ async function describeState(page) {
         cur = parent;
       }
       return path.join(" > ");
-    }
+    };
 
     const sel = 'a, button, input, select, textarea, [role="button"], [onclick], summary';
     const els = Array.from(document.querySelectorAll(sel)).slice(0, maxEl);
@@ -16604,11 +16604,11 @@ async function describeState(page) {
         css_selector: uniqueSelector(el)
       };
     });
-  }, 100);
+  }`, 100);
   return {
     url: page.url(),
     title: await page.title(),
-    elements
+    elements: state
   };
 }
 __name(describeState, "describeState");
