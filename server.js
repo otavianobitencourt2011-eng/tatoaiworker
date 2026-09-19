@@ -6,19 +6,18 @@
 // no plano Free do Cloudflare Workers.
 //
 // Variável de ambiente necessária no Render (aba "Environment"):
-//   BAI_API_KEY = ...
-// API OpenAI-compatible da B.AI (endpoint /v1/chat/completions) usando o
-// modelo gratuito Qwen3.8-Flash.
+//   NVIDIA_API_KEY = ...
+// API OpenAI-compatible da NVIDIA (integrate.api.nvidia.com, endpoint
+// /v1/chat/completions) usando o modelo GLM-5.3 (z-ai/glm-5.3).
 // ============================================================
 
 import express from 'express';
 
-const BAI_ENDPOINT = 'https://api.b.ai/v1/chat/completions';
-// ATENÇÃO: confirme esse ID exato na aba de modelos do painel da B.AI
-// (ou via GET https://api.b.ai/v1/models com sua chave) antes de subir pro
-// Render — a doc pública usa "your-model-id" como placeholder, o slug real
-// pode variar (ex: "qwen3.8-flash", "qwen/qwen3.8-flash").
-const MODEL = 'qwen3.8-flash';
+const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
+// Confirmado na página do modelo em build.nvidia.com/z-ai/glm-5-3: o slug
+// usado no campo "model" da requisição é com ponto ("z-ai/glm-5.3"), não
+// com hífen (o hífen aparece só na URL da página, não no id do modelo).
+const MODEL = 'z-ai/glm-5.3';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -26,15 +25,12 @@ const FETCH_TIMEOUT_MS = 1200000; // 20 minutos (era 5 min — cortava em respos
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
 
-// Tato 4.1 agora roda sobre Qwen3.8-Flash (via B.AI). O máximo de saída
-// documentado do modelo é 131.072 tokens — ficamos com folga abaixo disso
-// (130K, valor que você já vinha usando) pra não estourar o teto em nenhum
-// request. reasoning_effort aceita low/medium/high (mesmo formato usado
-// antes pro DeepSeek); o Qwen3.8-Flash também suporta preserve_thinking
-// pra manter o raciocínio de rodadas anteriores — não implementado aqui
-// ainda, pode valer a pena olhar se o histórico de tool-calling começar a
-// perder contexto de raciocínio entre chamadas.
-const MAX_TOKENS_STANDARD = 130000;
+// Tato 4.1 agora roda sobre GLM-5.3 (via NVIDIA). Ficamos em 128K de
+// max_tokens (128000), conforme pedido — a doc do modelo na NVIDIA cita
+// reasoning_effort aceitando low/high/max (default max) pro GLM-5.3, mas
+// mantemos "medium" aqui como já vinha sendo usado; se a API rejeitar ou
+// ignorar esse valor, vale testar "low" ou "high" nesse campo depois.
+const MAX_TOKENS_STANDARD = 128000;
 const REASONING_EFFORT_STANDARD = 'medium';
 
 // Limite único de tamanho de arquivo no backend.
@@ -1123,11 +1119,11 @@ app.post(
     res
   ) {
 
-    const BAI_API_KEY =
-      process.env.BAI_API_KEY;
+    const NVIDIA_API_KEY =
+      process.env.NVIDIA_API_KEY;
 
 
-    if (!BAI_API_KEY) {
+    if (!NVIDIA_API_KEY) {
       return res
         .status(500)
         .json({
@@ -1135,7 +1131,7 @@ app.post(
             false,
 
           error:
-            'BAI_API_KEY não configurada nas variáveis de ambiente.'
+            'NVIDIA_API_KEY não configurada nas variáveis de ambiente.'
         });
     }
 
@@ -1288,20 +1284,16 @@ app.post(
         ),
 
 
-      // Máximo de saída do Qwen3.8-Flash: 131.072 tokens (reasoning + saída
-      // visível somados). Ficamos abaixo disso de propósito (130K).
+      // Ficamos com 128K de max_tokens (reasoning + saída visível somados),
+      // conforme pedido.
       max_tokens:
         requestMaxTokens,
 
 
-      // Controle de raciocínio do Qwen3.8-Flash: low/medium/high.
-      // (Removemos o campo "thinking: {type:'enabled'}" que era específico
-      // do formato do DeepSeek/Anthropic — a B.AI/Qwen não usa esse campo
-      // no endpoint /v1/chat/completions; se o reasoning não vier ativo,
-      // o próximo teste é mandar reasoning_effort dentro de um objeto
-      // "reasoning": { effort: ... } — a doc da B.AI só documenta esse
-      // formato claramente pro endpoint /v1/responses, não pro
-      // /v1/chat/completions.)
+      // Controle de raciocínio: reaproveitando "medium" como já vinha sendo
+      // usado. (A doc do GLM-5.3 na NVIDIA documenta reasoning_effort
+      // aceitando low/high/max, default max — se "medium" for ignorado ou
+      // rejeitado pela API, vale testar "low"/"high" aqui.)
       reasoning_effort:
         requestReasoningEffort,
 
@@ -1384,7 +1376,7 @@ app.post(
 
         upstream =
           await fetch(
-            BAI_ENDPOINT,
+            NVIDIA_ENDPOINT,
             {
               method:
                 'POST',
@@ -1395,7 +1387,7 @@ app.post(
 
                 'Authorization':
                   'Bearer ' +
-                  BAI_API_KEY,
+                  NVIDIA_API_KEY,
 
                 'Accept':
                   'text/event-stream'
@@ -1606,7 +1598,7 @@ app.post(
     let pendingThinking =
       '';
 
-    // Mantemos reasoning_content completo pras próximas rodadas quando tools estão ativas (mesmo comportamento usado antes pro DeepSeek; o Qwen3.8-Flash tem um campo próprio pra isso, preserve_thinking, que ainda não está implementado aqui).
+    // Mantemos reasoning_content completo pras próximas rodadas quando tools estão ativas.
     let reasoningContentAcc =
       '';
 
@@ -1940,8 +1932,8 @@ app.post(
             {};
 
 
-          // Qwen3.8-Flash (via B.AI) usa reasoning_content no streaming.
-          // Alguns relays compatíveis podem normalizar o campo para
+          // GLM-5.3 (via NVIDIA) usa reasoning_content no streaming. Alguns
+          // relays compatíveis podem normalizar o campo para
           // reasoning/reasoning_text, então aceitamos essas variantes sem
           // depender de <think> dentro do conteúdo visível.
           const reasoningPiece =
@@ -1952,7 +1944,7 @@ app.post(
 
           if (reasoningPiece) {
             // Para o Tato 4.1, envie cada fragmento de reasoning assim que
-            // chegar. Isso reproduz o comportamento de streaming do Flash.
+            // chegar. Isso reproduz o comportamento de streaming do modelo.
             pendingThinking += reasoningPiece;
             reasoningContentAcc += reasoningPiece;
             registerThinking(reasoningPiece);
