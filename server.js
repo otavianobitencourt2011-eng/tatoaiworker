@@ -17,7 +17,7 @@ const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
 // Confirmado na pÃ¡gina do modelo em build.nvidia.com/z-ai/glm-5-3: o slug
 // usado no campo "model" da requisiÃ§Ã£o Ã© com ponto ("z-ai/glm-5.3"), nÃ£o
 // com hÃ­fen (o hÃ­fen aparece sÃ³ na URL da pÃ¡gina, nÃ£o no id do modelo).
-const MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b';
+const MODEL = 'google/gemma-4-31b-it';
 
 // Rodando no Render (sem limite de CPU time por request), dÃ¡ pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
