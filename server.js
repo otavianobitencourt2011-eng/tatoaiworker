@@ -17,7 +17,7 @@ const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
 // Confirmado na pÃ¡gina do modelo em build.nvidia.com/z-ai/glm-5-3: o slug
 // usado no campo "model" da requisiÃ§Ã£o Ã© com ponto ("z-ai/glm-5.3"), nÃ£o
 // com hÃ­fen (o hÃ­fen aparece sÃ³ na URL da pÃ¡gina, nÃ£o no id do modelo).
-const MODEL = 'google/gemma-4-31b-it';
+const MODEL = 'nvidia/nemotron-3-super-120b-a12b';
 
 // Rodando no Render (sem limite de CPU time por request), dÃ¡ pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -29,7 +29,7 @@ const FLUSH_MS = 60;
 // foi aumentado para 256K tokens.
 // O reasoning nÃ£o usa mais nÃ­veis: fica apenas ligado/desligado
 // e neste backend fica FORÃ‡ADO como ligado.
-const MAX_TOKENS_STANDARD = 256000;
+const MAX_TOKENS_STANDARD = 262144;
 const REASONING_ENABLED = true;
 
 // Limite Ãºnico de tamanho de arquivo no backend.
