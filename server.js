@@ -1336,7 +1336,8 @@ app.post(
 
 
     // ==========================================================
-    // RETRIES
+    // RETRIES (nível transporte: 429/502/503 vindos da NVIDIA antes
+    // mesmo de começar a receber qualquer byte do stream)
     // ==========================================================
 
     const MAX_RETRIES =
@@ -1365,161 +1366,149 @@ app.post(
       );
     }
 
+    // Extraído pra função porque agora pode ser chamado mais de uma vez:
+    // uma vez antes de abrir o SSE pro cliente, e de novo (silenciosamente)
+    // se uma tentativa terminar em "resposta vazia" (ver MAX_EMPTY_RETRIES
+    // mais abaixo). Retorna o Response da NVIDIA em caso de sucesso, ou
+    // null depois de já ter respondido `res` com um erro 502 (só é seguro
+    // fazer isso ANTES de res.writeHead ter sido chamado pro SSE).
+    async function requestUpstreamWithRetry() {
+      let upstream;
+      let lastErrStatus = null;
+      let lastErrText = '';
 
-    let upstream;
-    let lastErrStatus =
-      null;
+      try {
 
-    let lastErrText =
-      '';
+        for (
+          let attempt = 0;
+          attempt <=
+            MAX_RETRIES;
+          attempt++
+        ) {
+
+          upstream =
+            await fetch(
+              NVIDIA_ENDPOINT,
+              {
+                method:
+                  'POST',
+
+                headers: {
+                  'Content-Type':
+                    'application/json',
+
+                  'Authorization':
+                    'Bearer ' +
+                    NVIDIA_API_KEY,
+
+                  'Accept':
+                    'text/event-stream'
+                },
+
+                body:
+                  JSON.stringify(
+                    payload
+                  )
+              }
+            );
 
 
-    try {
+          if (
+            upstream.ok &&
+            upstream.body
+          ) {
+            return { upstream };
+          }
 
-      for (
-        let attempt = 0;
-        attempt <=
-          MAX_RETRIES;
-        attempt++
+
+          lastErrStatus =
+            upstream.status;
+
+
+          const isRetryable =
+            RETRYABLE_STATUS.has(
+              upstream.status
+            );
+
+
+          const isLastAttempt =
+            attempt ===
+            MAX_RETRIES;
+
+
+          if (
+            !isRetryable ||
+            isLastAttempt
+          ) {
+            lastErrText =
+              await upstream
+                .text()
+                .catch(
+                  function () {
+                    return '';
+                  }
+                );
+
+            break;
+          }
+
+
+          await upstream
+            .text()
+            .catch(
+              function () {
+                return '';
+              }
+            );
+
+
+          const retryAfterHeader =
+            upstream.headers.get(
+              'retry-after'
+            );
+
+
+          const retryAfterMs =
+            retryAfterHeader
+              ? (
+                  parseFloat(
+                    retryAfterHeader
+                  ) *
+                  1000
+                )
+              : null;
+
+
+          const backoffMs =
+            retryAfterMs &&
+            !isNaN(
+              retryAfterMs
+            )
+              ? retryAfterMs
+              : (
+                  1000 *
+                  Math.pow(
+                    2,
+                    attempt
+                  )
+                ) +
+                Math.floor(
+                  Math.random() *
+                    300
+                );
+
+
+          await sleep(
+            backoffMs
+          );
+        }
+
+      } catch (
+        err
       ) {
 
-        upstream =
-          await fetch(
-            NVIDIA_ENDPOINT,
-            {
-              method:
-                'POST',
-
-              headers: {
-                'Content-Type':
-                  'application/json',
-
-                'Authorization':
-                  'Bearer ' +
-                  NVIDIA_API_KEY,
-
-                'Accept':
-                  'text/event-stream'
-              },
-
-              body:
-                JSON.stringify(
-                  payload
-                )
-            }
-          );
-
-
-        if (
-          upstream.ok &&
-          upstream.body
-        ) {
-          break;
-        }
-
-
-        lastErrStatus =
-          upstream.status;
-
-
-        const isRetryable =
-          RETRYABLE_STATUS.has(
-            upstream.status
-          );
-
-
-        const isLastAttempt =
-          attempt ===
-          MAX_RETRIES;
-
-
-        if (
-          !isRetryable ||
-          isLastAttempt
-        ) {
-          lastErrText =
-            await upstream
-              .text()
-              .catch(
-                function () {
-                  return '';
-                }
-              );
-
-          break;
-        }
-
-
-        await upstream
-          .text()
-          .catch(
-            function () {
-              return '';
-            }
-          );
-
-
-        const retryAfterHeader =
-          upstream.headers.get(
-            'retry-after'
-          );
-
-
-        const retryAfterMs =
-          retryAfterHeader
-            ? (
-                parseFloat(
-                  retryAfterHeader
-                ) *
-                1000
-              )
-            : null;
-
-
-        const backoffMs =
-          retryAfterMs &&
-          !isNaN(
-            retryAfterMs
-          )
-            ? retryAfterMs
-            : (
-                1000 *
-                Math.pow(
-                  2,
-                  attempt
-                )
-              ) +
-              Math.floor(
-                Math.random() *
-                  300
-              );
-
-
-        await sleep(
-          backoffMs
-        );
+        return { fatal: true };
       }
-
-    } catch (
-      err
-    ) {
-
-      return res
-        .status(502)
-        .json({
-          ok:
-            false,
-
-          error:
-            'Server sobrecarregado, tente novamente mais tarde.'
-        });
-    }
-
-
-    if (
-      !upstream.ok ||
-      !upstream.body
-    ) {
 
       console.error(
         'Erro upstream da IA após retries — status:',
@@ -1534,16 +1523,24 @@ app.post(
         )
       );
 
+      return { fatal: true };
+    }
 
-      return res
-        .status(502)
-        .json({
-          ok:
-            false,
+    let upstream;
+    {
+      const first = await requestUpstreamWithRetry();
+      if (first.fatal || !first.upstream) {
+        return res
+          .status(502)
+          .json({
+            ok:
+              false,
 
-          error:
-            'Server sobrecarregado, tente novamente mais tarde.'
-        });
+            error:
+              'Server sobrecarregado, tente novamente mais tarde.'
+          });
+      }
+      upstream = first.upstream;
     }
 
 
@@ -1569,51 +1566,8 @@ app.post(
     );
 
 
-    const think =
-      makeThinkFilter();
-
-    let estimatedThinkingTokens = 0;
-
-    function registerThinking(text) {
-      if (!text) return;
-      estimatedThinkingTokens += Math.ceil(String(text).length / 4);
-    }
-
-
-    const toolCallsAcc =
-      [];
-
-
-    let contentAcc =
-      '';
-
-
-    let finishReason =
-      null;
-
-
-    let sawAnyChunk =
-      false;
-
-
     let closed =
       false;
-
-
-    let pendingDelta =
-      '';
-
-
-    let pendingThinking =
-      '';
-
-    // Mantemos reasoning_content completo pras próximas rodadas quando tools estão ativas.
-    let reasoningContentAcc =
-      '';
-
-
-    let flushTimer =
-      null;
 
 
     let reader =
@@ -1638,69 +1592,6 @@ app.post(
       } catch (e) {
         // conexão já fechou
       }
-    }
-
-
-    function flushPending() {
-
-      if (
-        flushTimer
-      ) {
-        clearTimeout(
-          flushTimer
-        );
-
-        flushTimer =
-          null;
-      }
-
-
-      if (
-        pendingThinking
-      ) {
-        send({
-          type:
-            'thinking',
-
-          text:
-            pendingThinking
-        });
-
-        pendingThinking =
-          '';
-      }
-
-
-      if (
-        pendingDelta
-      ) {
-        send({
-          type:
-            'delta',
-
-          text:
-            pendingDelta
-        });
-
-        pendingDelta =
-          '';
-      }
-    }
-
-
-    function scheduleFlush() {
-      if (
-        flushTimer ||
-        closed
-      ) {
-        return;
-      }
-
-      flushTimer =
-        setTimeout(
-          flushPending,
-          FLUSH_MS
-        );
     }
 
 
@@ -1738,15 +1629,6 @@ app.post(
       clearTimeout(
         timeoutId
       );
-
-
-      if (
-        flushTimer
-      ) {
-        clearTimeout(
-          flushTimer
-        );
-      }
 
 
       try {
@@ -1796,458 +1678,713 @@ app.post(
       );
 
 
-    reader =
-      upstream
-        .body
-        .getReader();
+    // ==========================================================
+    // LOOP DE TENTATIVAS "SILENCIOSAS" PARA RESPOSTA VAZIA
+    // ==========================================================
+    //
+    // O GLM-5.3 (via NVIDIA), principalmente logo depois de uma sequência
+    // de tool calls, às vezes termina o turno sem produzir NENHUM texto
+    // visível (finish_reason "stop", mas content vazio e nenhum tool_call
+    // novo) — tudo que ele gerou ficou só como reasoning/<think>. Antes,
+    // isso virava direto o erro "A IA não retornou uma resposta." pro
+    // usuário. Como é claramente uma falha do modelo nessa geração
+    // específica (não um erro de rede nem de payload), a correção certa é
+    // tentar de novo silenciosamente pedindo outra vez a MESMA completude
+    // à NVIDIA antes de desistir e mostrar erro. Streaming de texto real
+    // continua acontecendo ao vivo normalmente; só quando uma tentativa
+    // termina vazia é que fazemos uma nova chamada por trás dos panos.
+    const MAX_EMPTY_RETRIES = 2;
+
+    for (let emptyAttempt = 0; ; emptyAttempt++) {
+
+      const think =
+        makeThinkFilter();
+
+      let estimatedThinkingTokens = 0;
+
+      function registerThinking(text) {
+        if (!text) return;
+        estimatedThinkingTokens += Math.ceil(String(text).length / 4);
+      }
 
 
-    const decoder =
-      new TextDecoder();
+      const toolCallsAcc =
+        [];
 
 
-    let sseBuffer =
-      '';
+      let contentAcc =
+        '';
 
 
-    try {
+      let finishReason =
+        null;
 
-      while (
-        true
-      ) {
 
-        const {
-          done,
-          value
-        } =
-          await reader.read();
+      let sawAnyChunk =
+        false;
+
+
+      let pendingDelta =
+        '';
+
+
+      let pendingThinking =
+        '';
+
+      // Mantemos reasoning_content completo pras próximas rodadas quando tools estão ativas.
+      let reasoningContentAcc =
+        '';
+
+
+      let flushTimer =
+        null;
+
+
+      function flushPending() {
+
+        if (
+          flushTimer
+        ) {
+          clearTimeout(
+            flushTimer
+          );
+
+          flushTimer =
+            null;
+        }
 
 
         if (
-          done
+          pendingThinking
         ) {
-          break;
+          send({
+            type:
+              'thinking',
+
+            text:
+              pendingThinking
+          });
+
+          pendingThinking =
+            '';
         }
 
 
-        sawAnyChunk =
-          true;
-
-
-        sseBuffer +=
-          decoder.decode(
-            value,
-            {
-              stream:
-                true
-            }
-          );
-
-        // SSE pode chegar com LF ou CRLF. Normalizamos apenas as quebras
-        // de evento para garantir que reasoning_content/tool_calls sejam
-        // processados em streaming através de relays/proxies diferentes.
-        sseBuffer = sseBuffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-
-        let idx;
-
-        while (
-          (
-            idx =
-              sseBuffer.indexOf(
-                '\n\n'
-              )
-          ) !== -1
+        if (
+          pendingDelta
         ) {
+          send({
+            type:
+              'delta',
 
-          const rawEvent =
-            sseBuffer.slice(
-              0,
-              idx
-            );
+            text:
+              pendingDelta
+          });
 
-
-          sseBuffer =
-            sseBuffer.slice(
-              idx + 2
-            );
-
-
-          const line =
-            rawEvent
-              .split(
-                '\n'
-              )
-              .find(
-                function (
-                  l
-                ) {
-                  return (
-                    l.indexOf(
-                      'data:'
-                    ) ===
-                    0
-                  );
-                }
-              );
-
-
-          if (!line) {
-            continue;
-          }
-
-
-          const dataStr =
-            line
-              .slice(5)
-              .trim();
-
-
-          if (
-            !dataStr ||
-            dataStr ===
-              '[DONE]'
-          ) {
-            continue;
-          }
-
-
-          let evt;
-
-
-          try {
-            evt =
-              JSON.parse(
-                dataStr
-              );
-          } catch (
-            e
-          ) {
-            continue;
-          }
-
-
-          const choice =
-            evt.choices &&
-            evt.choices[0];
-
-
-          if (!choice) {
-            continue;
-          }
-
-
-          const delta =
-            choice.delta ||
-            {};
-
-
-          // GLM-5.3 (via NVIDIA) usa reasoning_content no streaming. Alguns
-          // relays compatíveis podem normalizar o campo para
-          // reasoning/reasoning_text, então aceitamos essas variantes sem
-          // depender de <think> dentro do conteúdo visível.
-          const reasoningPiece =
-            (typeof delta.reasoning_content === 'string' && delta.reasoning_content) ||
-            (typeof delta.reasoning === 'string' && delta.reasoning) ||
-            (typeof delta.reasoning_text === 'string' && delta.reasoning_text) ||
+          pendingDelta =
             '';
-
-          if (reasoningPiece) {
-            // Para o Tato 4.1, envie cada fragmento de reasoning assim que
-            // chegar. Isso reproduz o comportamento de streaming do modelo.
-            pendingThinking += reasoningPiece;
-            reasoningContentAcc += reasoningPiece;
-            registerThinking(reasoningPiece);
-            flushPending();
-          }
-
-
-          // content
-          if (
-            typeof
-              delta.content ===
-              'string' &&
-            delta.content
-          ) {
-
-            const parts =
-              think.feed(
-                delta.content
-              );
-
-
-            if (
-              parts.thinking
-            ) {
-
-              pendingThinking +=
-                parts.thinking;
-
-              reasoningContentAcc +=
-                parts.thinking;
-
-              registerThinking(parts.thinking);
-              scheduleFlush();
-            }
-
-
-            if (
-              parts.visible
-            ) {
-
-              contentAcc +=
-                parts.visible;
-
-              pendingDelta +=
-                parts.visible;
-
-              scheduleFlush();
-            }
-          }
-
-
-          // tool calls
-          if (
-            Array.isArray(
-              delta.tool_calls
-            )
-          ) {
-
-            for (
-              const tc of
-                delta.tool_calls
-            ) {
-
-              const i =
-                typeof
-                  tc.index ===
-                  'number'
-                  ? tc.index
-                  : 0;
-
-
-              if (
-                !toolCallsAcc[i]
-              ) {
-                toolCallsAcc[i] = {
-                  id:
-                    '',
-
-                  type:
-                    'function',
-
-                  function: {
-                    name:
-                      '',
-
-                    arguments:
-                      ''
-                  }
-                };
-              }
-
-
-              if (
-                tc.id
-              ) {
-                toolCallsAcc[i].id =
-                  tc.id;
-              }
-
-
-              if (
-                tc.function &&
-                tc.function.name
-              ) {
-                toolCallsAcc[i]
-                  .function
-                  .name +=
-                  tc.function.name;
-              }
-
-
-              let streamedToolDelta = false;
-              if (
-                tc.function &&
-                typeof
-                  tc.function.arguments ===
-                    'string'
-              ) {
-                toolCallsAcc[i]
-                  .function
-                  .arguments +=
-                  tc.function.arguments;
-                streamedToolDelta = true;
-              }
-
-              if (tc.function && tc.function.name) {
-                streamedToolDelta = true;
-              }
-
-              if (streamedToolDelta) {
-                send({
-                  type: 'tool_delta',
-                  index: i,
-                  id: tc.id || toolCallsAcc[i].id || '',
-                  name: tc.function && tc.function.name
-                    ? tc.function.name
-                    : toolCallsAcc[i].function.name,
-                  arguments: tc.function && typeof tc.function.arguments === 'string'
-                    ? tc.function.arguments
-                    : ''
-                });
-              }
-            }
-          }
-
-
-          if (
-            choice.finish_reason
-          ) {
-            finishReason =
-              choice.finish_reason;
-          }
         }
       }
 
-    } catch (
-      err
-    ) {
+
+      function scheduleFlush() {
+        if (
+          flushTimer ||
+          closed
+        ) {
+          return;
+        }
+
+        flushTimer =
+          setTimeout(
+            flushPending,
+            FLUSH_MS
+          );
+      }
+
+
+      reader =
+        upstream
+          .body
+          .getReader();
+
+
+      const decoder =
+        new TextDecoder();
+
+
+      let sseBuffer =
+        '';
+
+
+      try {
+
+        while (
+          true
+        ) {
+
+          const {
+            done,
+            value
+          } =
+            await reader.read();
+
+
+          if (
+            done
+          ) {
+            break;
+          }
+
+
+          sawAnyChunk =
+            true;
+
+
+          sseBuffer +=
+            decoder.decode(
+              value,
+              {
+                stream:
+                  true
+              }
+            );
+
+          // SSE pode chegar com LF ou CRLF. Normalizamos apenas as quebras
+          // de evento para garantir que reasoning_content/tool_calls sejam
+          // processados em streaming através de relays/proxies diferentes.
+          sseBuffer = sseBuffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+          let idx;
+
+          while (
+            (
+              idx =
+                sseBuffer.indexOf(
+                  '\n\n'
+                )
+            ) !== -1
+          ) {
+
+            const rawEvent =
+              sseBuffer.slice(
+                0,
+                idx
+              );
+
+
+            sseBuffer =
+              sseBuffer.slice(
+                idx + 2
+              );
+
+
+            const line =
+              rawEvent
+                .split(
+                  '\n'
+                )
+                .find(
+                  function (
+                    l
+                  ) {
+                    return (
+                      l.indexOf(
+                        'data:'
+                      ) ===
+                      0
+                    );
+                  }
+                );
+
+
+            if (!line) {
+              continue;
+            }
+
+
+            const dataStr =
+              line
+                .slice(5)
+                .trim();
+
+
+            if (
+              !dataStr ||
+              dataStr ===
+                '[DONE]'
+            ) {
+              continue;
+            }
+
+
+            let evt;
+
+
+            try {
+              evt =
+                JSON.parse(
+                  dataStr
+                );
+            } catch (
+              e
+            ) {
+              continue;
+            }
+
+
+            const choice =
+              evt.choices &&
+              evt.choices[0];
+
+
+            if (!choice) {
+              continue;
+            }
+
+
+            const delta =
+              choice.delta ||
+              {};
+
+
+            // GLM-5.3 (via NVIDIA) usa reasoning_content no streaming. Alguns
+            // relays compatíveis podem normalizar o campo para
+            // reasoning/reasoning_text, então aceitamos essas variantes sem
+            // depender de <think> dentro do conteúdo visível.
+            const reasoningPiece =
+              (typeof delta.reasoning_content === 'string' && delta.reasoning_content) ||
+              (typeof delta.reasoning === 'string' && delta.reasoning) ||
+              (typeof delta.reasoning_text === 'string' && delta.reasoning_text) ||
+              '';
+
+            if (reasoningPiece) {
+              // Para o Tato 4.1, envie cada fragmento de reasoning assim que
+              // chegar. Isso reproduz o comportamento de streaming do modelo.
+              pendingThinking += reasoningPiece;
+              reasoningContentAcc += reasoningPiece;
+              registerThinking(reasoningPiece);
+              flushPending();
+            }
+
+
+            // content
+            if (
+              typeof
+                delta.content ===
+                'string' &&
+              delta.content
+            ) {
+
+              const parts =
+                think.feed(
+                  delta.content
+                );
+
+
+              if (
+                parts.thinking
+              ) {
+
+                pendingThinking +=
+                  parts.thinking;
+
+                reasoningContentAcc +=
+                  parts.thinking;
+
+                registerThinking(parts.thinking);
+                scheduleFlush();
+              }
+
+
+              if (
+                parts.visible
+              ) {
+
+                contentAcc +=
+                  parts.visible;
+
+                pendingDelta +=
+                  parts.visible;
+
+                scheduleFlush();
+              }
+            }
+
+
+            // tool calls
+            if (
+              Array.isArray(
+                delta.tool_calls
+              )
+            ) {
+
+              for (
+                const tc of
+                  delta.tool_calls
+              ) {
+
+                const i =
+                  typeof
+                    tc.index ===
+                    'number'
+                    ? tc.index
+                    : 0;
+
+
+                if (
+                  !toolCallsAcc[i]
+                ) {
+                  toolCallsAcc[i] = {
+                    id:
+                      '',
+
+                    type:
+                      'function',
+
+                    function: {
+                      name:
+                        '',
+
+                      arguments:
+                        ''
+                    }
+                  };
+                }
+
+
+                if (
+                  tc.id
+                ) {
+                  toolCallsAcc[i].id =
+                    tc.id;
+                }
+
+
+                if (
+                  tc.function &&
+                  tc.function.name
+                ) {
+                  toolCallsAcc[i]
+                    .function
+                    .name +=
+                    tc.function.name;
+                }
+
+
+                let streamedToolDelta = false;
+                if (
+                  tc.function &&
+                  typeof
+                    tc.function.arguments ===
+                      'string'
+                ) {
+                  toolCallsAcc[i]
+                    .function
+                    .arguments +=
+                    tc.function.arguments;
+                  streamedToolDelta = true;
+                }
+
+                if (tc.function && tc.function.name) {
+                  streamedToolDelta = true;
+                }
+
+                if (streamedToolDelta) {
+                  send({
+                    type: 'tool_delta',
+                    index: i,
+                    id: tc.id || toolCallsAcc[i].id || '',
+                    name: tc.function && tc.function.name
+                      ? tc.function.name
+                      : toolCallsAcc[i].function.name,
+                    arguments: tc.function && typeof tc.function.arguments === 'string'
+                      ? tc.function.arguments
+                      : ''
+                  });
+                }
+              }
+            }
+
+
+            if (
+              choice.finish_reason
+            ) {
+              finishReason =
+                choice.finish_reason;
+            }
+          }
+        }
+
+      } catch (
+        err
+      ) {
+
+        flushPending();
+
+
+        send({
+          type:
+            'error',
+
+          error:
+            'Conexão com a IA caiu no meio do streaming: ' +
+            (
+              err &&
+              err.message ||
+              err
+            )
+        });
+
+
+        finish();
+
+        return;
+      }
+
+
+      // Processa qualquer texto final que o decoder ainda tenha mantido no buffer.
+      const decoderRemainder = decoder.decode();
+      if (decoderRemainder) {
+        sseBuffer += decoderRemainder.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      }
+
+      const leftover =
+        think.flushRemainder();
+
+
+      if (
+        leftover.visible
+      ) {
+
+        contentAcc +=
+          leftover.visible;
+
+        pendingDelta +=
+          leftover.visible;
+      }
+
 
       flushPending();
 
 
-      send({
-        type:
-          'error',
-
-        error:
-          'Conexão com a IA caiu no meio do streaming: ' +
-          (
-            err &&
-            err.message ||
-            err
-          )
-      });
-
-
-      finish();
-
-      return;
-    }
-
-
-    // Processa qualquer texto final que o decoder ainda tenha mantido no buffer.
-    const decoderRemainder = decoder.decode();
-    if (decoderRemainder) {
-      sseBuffer += decoderRemainder.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-    }
-
-    const leftover =
-      think.flushRemainder();
-
-
-    if (
-      leftover.visible
-    ) {
-
-      contentAcc +=
-        leftover.visible;
-
-      pendingDelta +=
-        leftover.visible;
-    }
-
-
-    flushPending();
-
-
-    if (
-      !sawAnyChunk
-    ) {
-
-      send({
-        type:
-          'error',
-
-        error:
-          'A IA não retornou nenhum dado (stream vazio).'
-      });
-
-
-      finish();
-
-      return;
-    }
-
-
-    // ==========================================================
-    // DEDUPE TOOL CALLS
-    // ==========================================================
-
-    function dedupeToolCalls(
-      calls
-    ) {
-      const seen =
-        new Set();
-
-      const out =
-        [];
-
-
-      for (
-        const tc of
-          calls
+      if (
+        !sawAnyChunk
       ) {
 
-        const key =
-          (
-            tc.function &&
-            tc.function.name ||
-            ''
-          ) +
-          '\u0000' +
-          (
-            tc.function &&
-            tc.function.arguments ||
-            ''
+        if (emptyAttempt < MAX_EMPTY_RETRIES) {
+          console.warn('[Tato 4.1] Stream vazio (tentativa ' + (emptyAttempt + 1) + '/' + (MAX_EMPTY_RETRIES + 1) + '), tentando de novo silenciosamente.');
+          const retryResult = await requestUpstreamWithRetry();
+          if (retryResult.fatal || !retryResult.upstream) {
+            send({ type: 'error', error: 'A IA não retornou nenhum dado (stream vazio).' });
+            finish();
+            return;
+          }
+          upstream = retryResult.upstream;
+          continue;
+        }
+
+        send({
+          type:
+            'error',
+
+          error:
+            'A IA não retornou nenhum dado (stream vazio).'
+        });
+
+
+        finish();
+
+        return;
+      }
+
+
+      // ==========================================================
+      // DEDUPE TOOL CALLS
+      // ==========================================================
+
+      function dedupeToolCalls(
+        calls
+      ) {
+        const seen =
+          new Set();
+
+        const out =
+          [];
+
+
+        for (
+          const tc of
+            calls
+        ) {
+
+          const key =
+            (
+              tc.function &&
+              tc.function.name ||
+              ''
+            ) +
+            '\u0000' +
+            (
+              tc.function &&
+              tc.function.arguments ||
+              ''
+            );
+
+
+          if (
+            seen.has(
+              key
+            )
+          ) {
+            continue;
+          }
+
+
+          seen.add(
+            key
+          );
+
+
+          out.push(
+            tc
+          );
+        }
+
+
+        return out;
+      }
+
+
+      const cleanToolCalls =
+        dedupeToolCalls(
+          toolCallsAcc.filter(
+            Boolean
+          )
+        );
+
+
+      if (
+        cleanToolCalls.length
+      ) {
+
+        send({
+          type:
+            'done',
+
+          message: {
+            role:
+              'assistant',
+
+            content:
+              contentAcc ||
+              null,
+
+            ...(reasoningContentAcc
+              ? { reasoning_content: reasoningContentAcc }
+              : {}),
+
+            tool_calls:
+              cleanToolCalls
+          },
+
+          limitReached:
+            false
+        });
+
+
+        finish();
+
+        return;
+      }
+
+
+      // ==========================================================
+      // RESPOSTA NORMAL
+      // ==========================================================
+
+      let reply =
+        contentAcc.trim();
+
+
+      if (
+        !reply
+      ) {
+
+        // Resposta veio vazia (só reasoning, sem texto visível e sem
+        // tool_calls). Se não foi por ter batido o limite de tokens (esse
+        // caso é um problema real de orçamento, não vale retry) e ainda
+        // sobrarem tentativas, tenta a mesma requisição de novo em vez de
+        // já devolver erro pro usuário — na prática resolve a maioria dos
+        // casos, já que é uma falha de geração pontual do modelo.
+        if (finishReason !== 'length' && emptyAttempt < MAX_EMPTY_RETRIES) {
+          console.warn('[Tato 4.1] Resposta final vazia (tentativa ' + (emptyAttempt + 1) + '/' + (MAX_EMPTY_RETRIES + 1) + '), tentando de novo silenciosamente. finishReason=' + finishReason);
+          const retryResult = await requestUpstreamWithRetry();
+          if (retryResult.fatal || !retryResult.upstream) {
+            send({ type: 'error', error: 'A IA não retornou uma resposta.' });
+            finish();
+            return;
+          }
+          upstream = retryResult.upstream;
+          continue;
+        }
+
+        const reason =
+          finishReason ===
+            'length'
+
+            ?
+
+          'A IA gastou todo o limite de tokens pensando e não sobrou espaço para a resposta visível. ' +
+          'O Tato 4.1 está com reasoning ativado e o limite é 256K tokens.'
+
+            :
+
+          'A IA não retornou uma resposta.';
+
+
+        send({
+          type:
+            'error',
+
+          error:
+            reason
+        });
+
+
+        finish();
+
+        return;
+      }
+
+
+      let limitReached =
+        false;
+
+
+      if (
+        finishReason ===
+        'length'
+      ) {
+
+        const trimmed =
+          trimToSafeBoundary(
+            reply
           );
 
 
         if (
-          seen.has(
-            key
-          )
+          trimmed
         ) {
-          continue;
+          reply =
+            trimmed;
         }
 
 
-        seen.add(
-          key
-        );
-
-
-        out.push(
-          tc
-        );
+        limitReached =
+          true;
       }
 
-
-      return out;
-    }
-
-
-    const cleanToolCalls =
-      dedupeToolCalls(
-        toolCallsAcc.filter(
-          Boolean
-        )
-      );
-
-
-    if (
-      cleanToolCalls.length
-    ) {
 
       send({
         type:
@@ -2258,123 +2395,25 @@ app.post(
             'assistant',
 
           content:
-            contentAcc ||
-            null,
+            reply,
 
           ...(reasoningContentAcc
             ? { reasoning_content: reasoningContentAcc }
-            : {}),
-
-          tool_calls:
-            cleanToolCalls
+            : {})
         },
 
         limitReached:
+          limitReached,
+        modelMode:
+          modelMode,
+        reasoningCheckpoint:
           false
       });
 
 
       finish();
-
       return;
     }
-
-
-    // ==========================================================
-    // RESPOSTA NORMAL
-    // ==========================================================
-
-    let reply =
-      contentAcc.trim();
-
-
-    if (
-      !reply
-    ) {
-
-      const reason =
-        finishReason ===
-          'length'
-
-          ?
-
-        'A IA gastou todo o limite de tokens pensando e não sobrou espaço para a resposta visível. ' +
-        'O Tato 4.1 está com reasoning ativado e o limite é 256K tokens.'
-
-          :
-
-        'A IA não retornou uma resposta.';
-
-
-      send({
-        type:
-          'error',
-
-        error:
-          reason
-      });
-
-
-      finish();
-
-      return;
-    }
-
-
-    let limitReached =
-      false;
-
-
-    if (
-      finishReason ===
-      'length'
-    ) {
-
-      const trimmed =
-        trimToSafeBoundary(
-          reply
-        );
-
-
-      if (
-        trimmed
-      ) {
-        reply =
-          trimmed;
-      }
-
-
-      limitReached =
-        true;
-    }
-
-
-    send({
-      type:
-        'done',
-
-      message: {
-        role:
-          'assistant',
-
-        content:
-          reply,
-
-        ...(reasoningContentAcc
-          ? { reasoning_content: reasoningContentAcc }
-          : {})
-      },
-
-      limitReached:
-        limitReached,
-      modelMode:
-        modelMode,
-      reasoningCheckpoint:
-        false
-    });
-
-
-    finish();
   }
 );
 
