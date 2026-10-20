@@ -718,146 +718,195 @@ function trimToSafeBoundary(
 
 
 // ============================================================
-// NORMALIZE HISTORY
+// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE)
 // ============================================================
 
-function normalizeHistory(
-  incoming
-) {
-  if (!Array.isArray(incoming)) {
-    return [];
+// Step 5 Preview accepts image_url content parts using either an HTTPS URL
+// or an image data URL (Base64). Supported data URL formats: PNG, JPEG and WebP.
+function isSupportedVisionUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  const url = value.trim();
+  return /^https?:\/\/\S+$/i.test(url) ||
+    /^data:image\/(?:png|jpe?g|webp);base64,[a-z0-9+/=\r\n]+$/i.test(url);
+}
+
+function normalizeVisionContent(content) {
+  if (typeof content === 'string') {
+    return content.trim() ? content.trim() : null;
+  }
+  if (!Array.isArray(content)) return null;
+
+  const normalized = [];
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+
+    if (part.type === 'text' && typeof part.text === 'string') {
+      if (part.text.trim()) normalized.push({ type: 'text', text: part.text });
+      continue;
+    }
+
+    if (part.type === 'image_url') {
+      const imageUrl = typeof part.image_url === 'string'
+        ? part.image_url
+        : part.image_url && part.image_url.url;
+      if (!isSupportedVisionUrl(imageUrl)) continue;
+
+      const imagePart = {
+        type: 'image_url',
+        image_url: { url: imageUrl.trim() }
+      };
+      const detail = part.image_url && typeof part.image_url === 'object'
+        ? part.image_url.detail
+        : part.detail;
+      if (['auto', 'low', 'high'].includes(detail)) {
+        imagePart.image_url.detail = detail;
+      }
+      normalized.push(imagePart);
+    }
   }
 
+  return normalized.length ? normalized : null;
+}
+
+function normalizeHistory(incoming) {
+  if (!Array.isArray(incoming)) return [];
 
   return incoming
-    .filter(
-      function (m) {
-        if (
-          !m ||
-          typeof m !==
-            'object'
-        ) {
-          return false;
-        }
+    .filter(function (m) {
+      if (!m || typeof m !== 'object') return false;
 
-
-        if (
-          m.role ===
-          'user'
-        ) {
-          return (
-            typeof m.content ===
-              'string' &&
-            m.content.trim()
-          );
-        }
-
-
-        if (
-          m.role ===
-          'assistant'
-        ) {
-          return (
-            (
-              typeof m.content ===
-                'string' &&
-              m.content.trim()
-            ) ||
-            typeof m.reasoning_content ===
-              'string' ||
-            Array.isArray(
-              m.tool_calls
-            )
-          );
-        }
-
-
-        if (
-          m.role ===
-          'tool'
-        ) {
-          return (
-            typeof m.content ===
-              'string' &&
-            m.tool_call_id
-          );
-        }
-
-
-        if (
-          m.role ===
-          'system'
-        ) {
-          return (
-            typeof m.content ===
-              'string' &&
-            m.content.trim()
-          );
-        }
-
-
-        return false;
+      if (m.role === 'user') {
+        return !!normalizeVisionContent(m.content);
       }
-    )
+
+      if (m.role === 'assistant') {
+        return (
+          (typeof m.content === 'string' && m.content.trim()) ||
+          typeof m.reasoning_content === 'string' ||
+          Array.isArray(m.tool_calls)
+        );
+      }
+
+      if (m.role === 'tool') {
+        return typeof m.content === 'string' && !!m.tool_call_id;
+      }
+
+      if (m.role === 'system') {
+        return typeof m.content === 'string' && !!m.content.trim();
+      }
+
+      return false;
+    })
     .slice(-60)
-    .map(
-      function (m) {
-
-        if (
-          m.role ===
-          'tool'
-        ) {
-          return {
-            role:
-              'tool',
-
-            tool_call_id:
-              m.tool_call_id,
-
-            content:
-              m.content
-          };
-        }
-
-
-        if (
-          m.role ===
-            'assistant' &&
-          Array.isArray(
-            m.tool_calls
-          )
-        ) {
-          return {
-            role:
-              'assistant',
-
-            content:
-              m.content ||
-              null,
-
-            tool_calls:
-              m.tool_calls,
-
-            ...(typeof m.reasoning_content === 'string'
-              ? { reasoning_content: m.reasoning_content }
-              : {})
-          };
-        }
-
-
+    .map(function (m) {
+      if (m.role === 'tool') {
         return {
-          role:
-            m.role,
+          role: 'tool',
+          tool_call_id: m.tool_call_id,
+          content: m.content
+        };
+      }
 
-          content:
-            m.content.trim(),
-
-          ...(m.role === 'assistant' && typeof m.reasoning_content === 'string'
+      if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
+        return {
+          role: 'assistant',
+          content: typeof m.content === 'string' ? (m.content || null) : null,
+          tool_calls: m.tool_calls,
+          ...(typeof m.reasoning_content === 'string'
             ? { reasoning_content: m.reasoning_content }
             : {})
         };
       }
-    );
+
+      if (m.role === 'user') {
+        return {
+          role: 'user',
+          content: normalizeVisionContent(m.content)
+        };
+      }
+
+      return {
+        role: m.role,
+        content: typeof m.content === 'string' ? m.content.trim() : null,
+        ...(m.role === 'assistant' && typeof m.reasoning_content === 'string'
+          ? { reasoning_content: m.reasoning_content }
+          : {})
+      };
+    });
+}
+
+// Also accept body.images as an optional convenience for clients that send
+// image attachments separately from messages. Entries may be URLs, data URLs,
+// or objects shaped like { url: "..." } / { image_url: { url: "..." } }.
+function attachSeparateImages(history, rawImages) {
+  if (!Array.isArray(rawImages) || !rawImages.length) return history;
+
+  let userIndex = -1;
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i] && history[i].role === 'user') {
+      userIndex = i;
+      break;
+    }
+  }
+  if (userIndex < 0) return history;
+
+  const current = history[userIndex].content;
+  if (Array.isArray(current) && current.some(part => part && part.type === 'image_url')) {
+    return history; // Images are already included in the message content.
+  }
+
+  const imageParts = [];
+  for (const entry of rawImages) {
+    const candidate = typeof entry === 'string'
+      ? entry
+      : entry && (
+          entry.url ||
+          (typeof entry.image_url === 'string' ? entry.image_url : entry.image_url && entry.image_url.url)
+        );
+    if (isSupportedVisionUrl(candidate)) {
+      imageParts.push({ type: 'image_url', image_url: { url: candidate.trim() } });
+    }
+  }
+  if (!imageParts.length) return history;
+
+  const parts = Array.isArray(current)
+    ? current.slice()
+    : (typeof current === 'string' && current.trim()
+        ? [{ type: 'text', text: current }]
+        : []);
+  history[userIndex] = {
+    ...history[userIndex],
+    content: parts.concat(imageParts)
+  };
+  return history;
+}
+
+// NVIDIA documents a maximum of eight images per request. Keep the newest
+// eight if a long conversation accumulated older image attachments.
+function limitHistoryImages(history) {
+  let total = 0;
+  for (const message of history) {
+    if (message && Array.isArray(message.content)) {
+      total += message.content.filter(part => part && part.type === 'image_url').length;
+    }
+  }
+  let toRemove = Math.max(0, total - 8);
+  if (!toRemove) return history;
+
+  for (const message of history) {
+    if (toRemove <= 0) break;
+    if (!message || !Array.isArray(message.content)) continue;
+    const next = [];
+    for (const part of message.content) {
+      if (toRemove > 0 && part && part.type === 'image_url') {
+        toRemove--;
+        continue;
+      }
+      next.push(part);
+    }
+    message.content = next;
+  }
+  return history;
 }
 
 
@@ -1062,7 +1111,7 @@ const app =
 app.use(
   express.json({
     limit:
-      '2mb'
+      '35mb'
   })
 );
 
@@ -1151,11 +1200,12 @@ app.post(
       req.body;
 
 
-    const history =
-      normalizeHistory(
-        body &&
-          body.messages
-      );
+    const history = limitHistoryImages(
+      attachSeparateImages(
+        normalizeHistory(body && body.messages),
+        body && body.images
+      )
+    );
 
 
     if (!history.length) {
@@ -1294,7 +1344,8 @@ app.post(
           ]
         ),
 
-      // Limite máximo de saída: 256K tokens.
+      // Limite máximo de saída: 256K tokens. O corpo JSON aceita até 35 MB
+      // para mensagens multimodais com imagens Base64 e histórico textual.
       max_tokens:
         requestMaxTokens,
 
