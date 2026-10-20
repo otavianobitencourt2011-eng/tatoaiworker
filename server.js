@@ -8,16 +8,14 @@
 // Variável de ambiente necessária no Render (aba "Environment"):
 //   NVIDIA_API_KEY = ...
 // API OpenAI-compatible da NVIDIA (integrate.api.nvidia.com, endpoint
-// /v1/chat/completions) usando o modelo GLM-5.3 (z-ai/glm-5.3).
+// /v1/chat/completions) usando o modelo Step 5 Preview (stepfun-ai/step-5-preview).
 // ============================================================
 
 import express from 'express';
 
 const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
-// Confirmado na página do modelo em build.nvidia.com/z-ai/glm-5-3: o slug
-// usado no campo "model" da requisição é com ponto ("z-ai/glm-5.3"), não
-// com hífen (o hífen aparece só na URL da página, não no id do modelo).
-const MODEL = 'nvidia/nemotron-3-super-120b-a12b';
+// ID confirmado na NVIDIA Build: stepfun-ai/step-5-preview.
+const MODEL = 'stepfun-ai/step-5-preview';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -25,7 +23,7 @@ const FETCH_TIMEOUT_MS = 1200000; // 20 minutos (era 5 min — cortava em respos
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
 
-// Tato 4.1 agora roda sobre GLM-5.3 (via NVIDIA). O limite de saída
+// Tato 4.1 agora roda sobre Step 5 Preview (via NVIDIA). O limite de saída
 // foi aumentado para 256K tokens.
 // O reasoning não usa mais níveis: fica apenas ligado/desligado
 // e neste backend fica FORÇADO como ligado.
@@ -295,7 +293,7 @@ function buildSystemPrompt(
 
 
   return (
-  'Você é o Tato 4.1, o agente principal do app Tato IA, executando sobre Qwen3.8-Flash. ' +
+  'Você é o Tato 4.1, o agente principal do app Tato IA. ' +
   'Você opera como agente, não apenas como chatbot. Quando ferramentas estiverem disponíveis, avalie a solicitação e use as ferramentas necessárias antes de responder. ' +
   'Em tarefas de programação e arquivos, atue diretamente pelas ferramentas: inspecione o estado real, crie/edite os arquivos, execute verificações e só finalize quando a tarefa estiver concluída. ' +
   'Nunca entregue projetos grandes ou código completo diretamente no chat quando uma ferramenta de arquivo puder criar o arquivo. Nunca alegue ter executado, testado, pesquisado ou alterado algo sem usar a ferramenta correspondente. ' +
@@ -1304,7 +1302,9 @@ app.post(
       // Neste backend ele fica permanentemente ligado.
       chat_template_kwargs: {
         enable_thinking:
-          reasoningEnabled
+          reasoningEnabled,
+        preserve_thinking:
+          true
       },
 
       stream:
@@ -1682,15 +1682,11 @@ app.post(
     // LOOP DE TENTATIVAS "SILENCIOSAS" PARA RESPOSTA VAZIA
     // ==========================================================
     //
-    // O GLM-5.3 (via NVIDIA), principalmente logo depois de uma sequência
-    // de tool calls, às vezes termina o turno sem produzir NENHUM texto
+    // O modelo pode ocasionalmente terminar um turno sem produzir NENHUM texto
     // visível (finish_reason "stop", mas content vazio e nenhum tool_call
-    // novo) — tudo que ele gerou ficou só como reasoning/<think>. Antes,
-    // isso virava direto o erro "A IA não retornou uma resposta." pro
-    // usuário. Como é claramente uma falha do modelo nessa geração
-    // específica (não um erro de rede nem de payload), a correção certa é
-    // tentar de novo silenciosamente pedindo outra vez a MESMA completude
-    // à NVIDIA antes de desistir e mostrar erro. Streaming de texto real
+    // novo) — tudo que ele gerou ficou só como reasoning/<think>. Para evitar
+    // mostrar diretamente o erro "A IA não retornou uma resposta.", tentamos
+    // novamente em silêncio antes de desistir. O streaming de texto real
     // continua acontecendo ao vivo normalmente; só quando uma tentativa
     // termina vazia é que fazemos uma nova chamada por trás dos panos.
     const MAX_EMPTY_RETRIES = 2;
@@ -1948,7 +1944,7 @@ app.post(
               {};
 
 
-            // GLM-5.3 (via NVIDIA) usa reasoning_content no streaming. Alguns
+            // Step 5 Preview (via NVIDIA) envia reasoning_content no streaming. Alguns
             // relays compatíveis podem normalizar o campo para
             // reasoning/reasoning_text, então aceitamos essas variantes sem
             // depender de <think> dentro do conteúdo visível.
