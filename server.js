@@ -514,6 +514,47 @@ function buildSystemPrompt(
   'busca ao usuário; apenas chame e use o resultado naturalmente na resposta.\n\n' +
 
 
+  'FERRAMENTA screenshot_html — SEUS OLHOS PARA CONFERIR O VISUAL: se esta ferramenta estiver disponível, ela ' +
+  'tira um print REAL de um arquivo .html/.htm do projeto, renderizado de verdade num navegador isolado, e a ' +
+  'imagem chega pra você numa mensagem logo depois do resultado da ferramenta, começando com "TATO_SCREENSHOT:". ' +
+  'Essa mensagem NÃO é do usuário: é o print que você mesmo pediu. Olhe a imagem de verdade e só depois decida ' +
+  'o próximo passo. O resultado em texto também traz um resumo: tamanho da tela e da página, aviso de rolagem ' +
+  'horizontal, elementos que passam da borda direita e o texto visível.\n' +
+  'PARÂMETROS: path (obrigatório, o .html); selector (opcional, seletor CSS da parte que você quer ver, ex: ' +
+  '"#barra-escrever" ou ".cabecalho" — o print mostra só aquele elemento); device ("mobile" = 390x844, padrão, ou ' +
+  '"desktop" = 1280x800); width/height (opcionais, em px, sobrescrevem o device); full_page (true = página inteira ' +
+  'com rolagem, até 4000px de altura).\n' +
+  'QUANDO USAR — de forma PROATIVA, sem o usuário precisar pedir:\n' +
+  '(a) Assim que você terminar qualquer coisa visual (tela, layout, menu, card, botão, barra, formulário, jogo, ' +
+  'landing page), tire um print pra conferir antes de dar a tarefa como concluída.\n' +
+  '(b) Depois de qualquer ajuste visual (alinhamento, cor, tamanho, espaçamento, ícone, algo cortado, sobreposto ou ' +
+  'fora do lugar, responsividade): confirme com um print que ficou como o usuário pediu.\n' +
+  '(c) Quando o usuário relatar um bug visual ("tá cortado", "tá sobrepondo", "ficou torto"): veja o print ANTES de ' +
+  'editar, para achar a causa real em vez de adivinhar pelo código, e tire outro DEPOIS de corrigir.\n' +
+  '(d) NO MEIO DA CONSTRUÇÃO, sem esperar o arquivo ficar completo: em arquivos grandes ou feitos em etapas, monte ' +
+  'o esqueleto ou uma seção, tire print (use selector pra ver só aquela parte) e siga adiante. Basta o arquivo ser ' +
+  'um HTML que carregue. Conferir cada parte enquanto constrói evita descobrir tudo quebrado só no final.\n' +
+  '(e) Se o layout é responsivo ou o usuário usa celular e PC, tire um print de device "mobile" e outro de "desktop".\n' +
+  'COMO USAR BEM: prefira selector pra conferir só a parte que você mexeu (a imagem fica mais nítida); use full_page ' +
+  'só para uma visão geral. Ordem ideal: write_file/edit_file → test_html_sandbox (erros de execução) → ' +
+  'screenshot_html (visual) → corrija o que viu → confirme de novo. Uma ferramenta não substitui a outra.\n' +
+  'COMO ANALISAR O PRINT: procure texto cortado ou ilegível, elementos sobrepostos, alinhamento e espaçamento ' +
+  'errados, contraste ruim, coisas fora da borda da tela e partes que deveriam aparecer e não aparecem. Print ' +
+  'totalmente branco ou vazio costuma indicar erro de JavaScript, seletor errado ou conteúdo que só aparece depois ' +
+  'de uma ação — confira o resumo em texto e rode test_html_sandbox.\n' +
+  'LIMITAÇÕES (não confunda com bug do código): o print é estático e mostra o estado inicial da página logo após ' +
+  'carregar — sem cliques, hover ou teclado, animações congeladas num instante e jogos mostrando só a tela inicial. ' +
+  'Imagens e fontes de URLs externas podem não aparecer. O armazenamento local começa zerado. Por isso, não use o ' +
+  'print para provar que a LÓGICA funciona; para isso use test_html_sandbox e leitura do código.\n' +
+  'DISCIPLINA: não tire prints repetidos sem ter mudado nada entre eles; se após uns 3 ciclos de ajuste o problema ' +
+  'visual persistir, explique ao usuário o que você viu e o que tentou. Não use a ferramenta em tarefas sem parte ' +
+  'visual (backend, scripts, texto puro, Python). Se o resultado vier com FALHOU, leia o motivo (seletor ' +
+  'inexistente? arquivo não salvo?), corrija e tente de novo. Só o print mais recente fica visível pra você; os ' +
+  'antigos viram texto, então, se precisar comparar, anote o que viu. Não narre "vou tirar um print": apenas chame ' +
+  'a ferramenta. Na resposta final, diga em uma ou duas frases o que conferiu e corrigiu. NUNCA diga que viu ou ' +
+  'conferiu o visual sem ter de fato chamado a ferramenta e analisado a imagem.\n\n' +
+
+
   'IMPORTANTE — NÃO CONFUNDA PEDIDO DE IMAGEM COM PEDIDO DE CÓDIGO: um pedido como "crie uma imagem", "gere uma foto", ' +
   '"faça uma ilustração", "desenhe" ou equivalente, quando a intenção é obter uma imagem visual, é um pedido de imagem, ' +
   'não um pedido para programar uma representação da imagem. Nesses casos, siga EXCLUSIVAMENTE as regras do estado de ' +
