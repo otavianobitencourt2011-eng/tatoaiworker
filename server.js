@@ -16,6 +16,10 @@ import express from 'express';
 const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
 // ID confirmado na NVIDIA Build: stepfun-ai/step-5-preview.
 const MODEL = 'stepfun-ai/step-5-preview';
+// O Step 5 Preview mantém reasoning mesmo com enable_thinking=false. Para que
+// o modo rápido seja realmente rápido, o Tato usa um checkpoint multimodal que
+// aceita reasoning_effort='none'. "Pensar Mais" continua usando o Step 5 atual.
+const MODEL_FAST = 'nvidia/nemotron-3.5-super-vl-120b-a12b';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -28,6 +32,9 @@ const FLUSH_MS = 60;
 // O reasoning é controlado pelo seletor "Pensar Mais" do frontend.
 // Padrão: desligado (NONE); ativado apenas quando reasoning_enabled === true.
 const MAX_TOKENS_STANDARD = 262144;
+// O endpoint Nemotron 3.5 Super VL documenta máximo de saída de 131072 tokens.
+// O limite de 262144 continua intacto no modo Pensar Mais (Step 5 Preview).
+const MAX_TOKENS_FAST = 131072;
 
 // Limite único de tamanho de arquivo no backend.
 const MAX_FILE_BYTES_STANDARD = 1 * 1024 * 1024;
@@ -995,8 +1002,11 @@ app.post(
 
     // Este worker é o backend do Tato 4.1.
     const modelMode = 'tato-4.1';
-    const requestMaxTokens = MAX_TOKENS_STANDARD;
     const reasoningEnabled = !!(body && body.reasoning_enabled === true);
+    // O botão escolhe um modo real de inferência: o modelo atual com raciocínio
+    // completo ou o modelo multimodal de execução rápida com reasoning_effort=none.
+    const requestModel = reasoningEnabled ? MODEL : MODEL_FAST;
+    const requestMaxTokens = reasoningEnabled ? MAX_TOKENS_STANDARD : MAX_TOKENS_FAST;
 
 
     const imageContext =
@@ -1008,7 +1018,7 @@ app.post(
 
     const payload = {
       model:
-        MODEL,
+        requestModel,
 
       messages:
         [
@@ -1070,11 +1080,11 @@ app.post(
 
       temperature: 0.2,
 
-      // Padrão NONE. O frontend envia reasoning_enabled=true somente com "Pensar Mais" ativo.
-      chat_template_kwargs: {
-        enable_thinking: reasoningEnabled,
-        preserve_thinking: reasoningEnabled
-      },
+      // Pensar Mais usa o template original do Step 5. No modo rápido, usamos
+      // o controle oficialmente suportado pelo Nemotron: reasoning_effort=none.
+      ...(reasoningEnabled
+        ? { chat_template_kwargs: { enable_thinking: true, preserve_thinking: true } }
+        : { reasoning_effort: 'none' }),
 
       stream:
         true
@@ -1408,23 +1418,6 @@ app.post(
     }
 
 
-    req.on(
-      'close',
-      function () {
-        closed =
-          true;
-
-        if (reader) {
-          try {
-            reader.cancel();
-          } catch (e) {
-            // ignora
-          }
-        }
-      }
-    );
-
-
     const heartbeatId =
       setInterval(
         ping,
@@ -1445,6 +1438,27 @@ app.post(
         },
         FETCH_TIMEOUT_MS
       );
+
+
+    // O evento "close" de IncomingMessage (req) pode ocorrer assim que o
+    // corpo do POST termina de ser lido. Não o use para encerrar um SSE longo:
+    // isso interrompia respostas válidas no meio e aparecia no frontend como
+    // "network error". A vida do stream do cliente é acompanhada pelo res.
+    res.on('close', function () {
+      // O close emitido depois de res.end() é normal; só cancela se o cliente
+      // realmente desconectou antes de o servidor terminar a resposta.
+      if (res.writableEnded || closed) return;
+      closed = true;
+      clearInterval(heartbeatId);
+      clearTimeout(timeoutId);
+      if (reader) {
+        try {
+          Promise.resolve(reader.cancel()).catch(function () {});
+        } catch (e) {
+          // o stream já pode estar cancelado
+        }
+      }
+    });
 
 
     // ==========================================================
@@ -1724,12 +1738,14 @@ app.post(
               '';
 
             if (reasoningPiece) {
-              // Para o Tato 4.1, envie cada fragmento de reasoning assim que
-              // chegar. Isso reproduz o comportamento de streaming do modelo.
-              pendingThinking += reasoningPiece;
+              // Preserve o contexto de reasoning para a continuidade de tool calls,
+              // mas só exiba a trilha de pensamento quando "Pensar Mais" estiver ativo.
               reasoningContentAcc += reasoningPiece;
               registerThinking(reasoningPiece);
-              flushPending();
+              if (reasoningEnabled) {
+                pendingThinking += reasoningPiece;
+                flushPending();
+              }
             }
 
 
@@ -1747,18 +1763,13 @@ app.post(
                 );
 
 
-              if (
-                parts.thinking
-              ) {
-
-                pendingThinking +=
-                  parts.thinking;
-
-                reasoningContentAcc +=
-                  parts.thinking;
-
+              if (parts.thinking) {
+                reasoningContentAcc += parts.thinking;
                 registerThinking(parts.thinking);
-                scheduleFlush();
+                if (reasoningEnabled) {
+                  pendingThinking += parts.thinking;
+                  scheduleFlush();
+                }
               }
 
 
@@ -2100,8 +2111,9 @@ app.post(
 
             ?
 
-          'A IA gastou todo o limite de tokens pensando e não sobrou espaço para a resposta visível. ' +
-          'O Tato 4.1 está com reasoning ativado e o limite é 256K tokens.'
+          'A IA atingiu o limite de saída desta requisição (' +
+          requestMaxTokens.toLocaleString('pt-BR') +
+          ' tokens) antes de concluir a resposta.'
 
             :
 
