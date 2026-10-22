@@ -16,10 +16,6 @@ import express from 'express';
 const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
 // ID confirmado na NVIDIA Build: stepfun-ai/step-5-preview.
 const MODEL = 'stepfun-ai/step-5-preview';
-// O Step 5 Preview mantém reasoning mesmo com enable_thinking=false. Para que
-// o modo rápido seja realmente rápido, o Tato usa um checkpoint multimodal que
-// aceita reasoning_effort='none'. "Pensar Mais" continua usando o Step 5 atual.
-const MODEL_FAST = 'nvidia/nemotron-3.5-super-vl-120b-a12b';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -29,12 +25,10 @@ const FLUSH_MS = 60;
 
 // Tato 4.1 agora roda sobre Step 5 Preview (via NVIDIA). O limite de saída
 // foi aumentado para 256K tokens.
-// O reasoning é controlado pelo seletor "Pensar Mais" do frontend.
-// Padrão: desligado (NONE); ativado apenas quando reasoning_enabled === true.
+// O reasoning não usa mais níveis: fica apenas ligado/desligado
+// e neste backend fica FORÇADO como ligado.
 const MAX_TOKENS_STANDARD = 262144;
-// O endpoint Nemotron 3.5 Super VL documenta máximo de saída de 131072 tokens.
-// O limite de 262144 continua intacto no modo Pensar Mais (Step 5 Preview).
-const MAX_TOKENS_FAST = 131072;
+const REASONING_ENABLED = true;
 
 // Limite único de tamanho de arquivo no backend.
 const MAX_FILE_BYTES_STANDARD = 1 * 1024 * 1024;
@@ -120,23 +114,132 @@ function normalizeImageContext(body, tools) {
 // LEMBRETE FINAL DE IMAGEM
 // ============================================================
 
-function buildImageReminder(lang, imageContext, tools) {
-  const state = imageContext && imageContext.state ? imageContext.state : 'unknown';
-  const names = (Array.isArray(tools) ? tools : []).map(function(tool){
-    return tool && tool.function && tool.function.name ? String(tool.function.name) : '';
-  }).filter(Boolean);
-  const hasCreator = names.includes('imagecreator');
-  const hasAsk = names.includes('ask_image');
+function buildImageReminder(
+  lang,
+  imageContext,
+  tools
+) {
+  const state =
+    imageContext &&
+    imageContext.state
+      ? imageContext.state
+      : 'unknown';
+
+  const names =
+    (Array.isArray(tools) ? tools : [])
+      .map(function (tool) {
+        return (
+          tool &&
+          tool.function &&
+          tool.function.name
+            ? String(
+                tool.function.name
+              )
+            : ''
+        );
+      })
+      .filter(Boolean);
+
+  const hasCreator =
+    names.includes(
+      'imagecreator'
+    );
+
+  const hasAsk =
+    names.includes(
+      'ask_image'
+    );
+
+
   if (lang === 'en-US') {
-    if (state === 'guest') return 'IMAGE ACCESS: user is signed out; image generation is unavailable. ' + (hasAsk ? 'Use ask_image to explain Google login is required.' : 'Explain Google login is required.') + ' Never substitute code/HTML/SVG for an image.';
-    if (state === 'authenticated_off') return 'IMAGE MODE: user is signed in but image generation is off. ' + (hasAsk ? 'Use ask_image to ask whether to enable it.' : 'Explain image mode must be enabled.') + ' Never substitute code/HTML/SVG for an image.';
-    if (state === 'authenticated_on') return 'IMAGE MODE is on. For image-generation requests use imagecreator when available (' + hasCreator + '); never substitute code/HTML/SVG.';
-    return 'For image-generation requests, use the dedicated image tool when available; never substitute code/HTML/SVG.';
+
+    if (state === 'guest') {
+      return (
+        'IMAGE ACCESS REMINDER: this user is NOT signed in with Google. ' +
+        'Image creation is unavailable. Never replace an image request with ' +
+        'HTML, SVG, canvas, code, or a textual simulation. ' +
+        (
+          hasAsk
+            ? 'Use ask_image to tell the user Google login is required.'
+            : 'Tell the user directly that Google login is required.'
+        )
+      );
+    }
+
+
+    if (state === 'authenticated_off') {
+      return (
+        'IMAGE MODE REMINDER: the user is signed in with Google, but image mode is OFF. ' +
+        'Never replace an image request with HTML, SVG, canvas, or code. ' +
+        (
+          hasAsk
+            ? 'Use ask_image to ask whether image mode may be enabled.'
+            : 'Tell the user that image mode must be enabled.'
+        )
+      );
+    }
+
+
+    if (state === 'authenticated_on') {
+      return (
+        'IMAGE MODE REMINDER: image mode is ON and imagecreator is available (' +
+        hasCreator +
+        '). For an actual image request, use imagecreator. ' +
+        'Never create HTML/SVG/canvas/code as a substitute.'
+      );
+    }
+
+
+    return (
+      'IMAGE REMINDER: never replace a real image-generation request with ' +
+      'HTML/SVG/canvas/code. Use the dedicated image tool when available; ' +
+      'otherwise explain the limitation.'
+    );
   }
-  if (state === 'guest') return 'ACESSO A IMAGENS: usuário não está autenticado; geração indisponível. ' + (hasAsk ? 'Use ask_image para explicar que o login Google é necessário.' : 'Explique que o login Google é necessário.') + ' Nunca substitua imagem por código/HTML/SVG.';
-  if (state === 'authenticated_off') return 'MODO IMAGEM: usuário está autenticado, mas a geração está desligada. ' + (hasAsk ? 'Use ask_image para perguntar se pode ativar.' : 'Explique que é preciso ativar o modo.') + ' Nunca substitua imagem por código/HTML/SVG.';
-  if (state === 'authenticated_on') return 'MODO IMAGEM ligado: em pedidos de geração, use imagecreator quando disponível (' + hasCreator + '); nunca substitua por código/HTML/SVG.';
-  return 'Em pedidos de geração de imagem, use a ferramenta de imagem quando disponível; nunca substitua por código/HTML/SVG.';
+
+
+  if (state === 'guest') {
+    return (
+      'LEMBRETE DE ACESSO A IMAGENS: este usuário NÃO está logado com uma conta Google. ' +
+      'A criação de imagens está indisponível. Nunca substitua uma imagem por ' +
+      'HTML, SVG, canvas, código ou simulação textual. ' +
+      (
+        hasAsk
+          ? 'Use ask_image para informar que o login com Google é necessário.'
+          : 'Diga diretamente que é necessário fazer login com Google.'
+      )
+    );
+  }
+
+
+  if (state === 'authenticated_off') {
+    return (
+      'LEMBRETE DO MODO IMAGEM: o usuário está autenticado com Google, mas o modo Criar Imagem está DESLIGADO. ' +
+      'Nunca substitua uma imagem por HTML, SVG, canvas ou código. ' +
+      (
+        hasAsk
+          ? 'Use ask_image para perguntar se pode ativar o modo imagem.'
+          : 'Informe que o modo imagem precisa ser ativado.'
+      )
+    );
+  }
+
+
+  if (state === 'authenticated_on') {
+    return (
+      'LEMBRETE DO MODO IMAGEM: o modo Criar Imagem está LIGADO e imagecreator está disponível (' +
+      hasCreator +
+      '). Para um pedido real de imagem, use imagecreator. ' +
+      'Nunca substitua a imagem por HTML/SVG/canvas/código.'
+    );
+  }
+
+
+  return (
+    'LEMBRETE DE IMAGEM: nunca substitua um pedido real de geração de imagem ' +
+    'por HTML/SVG/canvas/código. Use a ferramenta específica de imagem quando ' +
+    'estiver disponível; caso contrário, explique a limitação.'
+  );
 }
 
 
@@ -144,13 +247,58 @@ function buildImageReminder(lang, imageContext, tools) {
 // SYSTEM PROMPT
 // ============================================================
 
-function buildSystemPrompt(lang) {
+function buildSystemPrompt(
+  lang,
+  imageContext
+) {
+  const imageState =
+    imageContext &&
+    imageContext.state
+      ? imageContext.state
+      : 'unknown';
+
+
+  const imageDirective =
+    imageState === 'guest'
+      ?
+
+      'Este usuário NÃO está autenticado com uma conta Google. ' +
+      'Ele NÃO pode criar imagens. Se pedir uma imagem, use ask_image ' +
+      'quando disponível para informar que o login Google é necessário. ' +
+      'NUNCA tente criar HTML, SVG, canvas, código ou qualquer representação ' +
+      'alternativa da imagem.'
+
+      :
+
+    imageState === 'authenticated_off'
+      ?
+
+      'Este usuário está autenticado com Google, mas o modo Criar Imagem está DESLIGADO. ' +
+      'Se pedir uma imagem, use ask_image quando disponível para perguntar se pode ' +
+      'ativar o modo. NUNCA tente criar HTML, SVG, canvas ou código para representar a imagem.'
+
+      :
+
+    imageState === 'authenticated_on'
+      ?
+
+      'Este usuário está autenticado com Google e o modo Criar Imagem está LIGADO. ' +
+      'Se pedir uma imagem, use imagecreator. NUNCA substitua a geração por HTML, SVG, ' +
+      'canvas ou código.'
+
+      :
+
+      'Se o usuário pedir uma imagem, use a ferramenta específica de imagem quando disponível. ' +
+      'Nunca substitua uma geração de imagem por HTML, SVG, canvas ou código.';
+
+
   return (
   'Você é o Tato 4.1, o agente principal do app Tato IA. ' +
   'Você opera como agente, não apenas como chatbot. Quando ferramentas estiverem disponíveis, avalie a solicitação e use as ferramentas necessárias antes de responder. ' +
   'Em tarefas de programação e arquivos, atue diretamente pelas ferramentas: inspecione o estado real, crie/edite os arquivos, execute verificações e só finalize quando a tarefa estiver concluída. ' +
   'Nunca entregue projetos grandes ou código completo diretamente no chat quando uma ferramenta de arquivo puder criar o arquivo. Nunca alegue ter executado, testado, pesquisado ou alterado algo sem usar a ferramenta correspondente. ' +
-  languageDirective(lang) +
+  languageDirective(lang) + ' ' +
+  imageDirective +
   '\n\n' +
 
   'DISCIPLINA DE EXECUÇÃO, CLAREZA E ANTI-REPETIÇÃO: trabalhe de forma objetiva e consistente. Antes de agir, ' +
@@ -183,18 +331,33 @@ function buildSystemPrompt(lang) {
   'interna e nunca deve ser mencionada, mesmo comparando os dois. ' +
   '\n\n' +
 
-  'FERRAMENTA import_project_file: se o usuário mencionar um Project (inclusive {NomeDoProjeto}) e pedir uma ação ' +
-  'sobre arquivo que não foi anexado diretamente à conversa, importe o arquivo antes de ler ou editar. Se configs ou ' +
-  'arquivos complementares puderem ser necessários, use include_complements=true. Só pule a importação quando o arquivo ' +
-  'já estiver disponível nesta conversa, confirmado por list_files quando necessário. ' +
+  'FERRAMENTA import_project_file — OBRIGATÓRIA QUANDO UM PROJECT FOR MENCIONADO: sempre que o usuário mencionar ' +
+  'um Project (seja pela marcação "{NomeDoProjeto}", seja citando o nome do Project em texto normal) pedindo ' +
+  'alguma coisa sobre ele, e o arquivo relevante NÃO tiver sido mandado/anexado diretamente nesta conversa (ou ' +
+  'seja, é um Project mencionado, não um arquivo já presente no chat), a PRIMEIRA ação obrigatória, antes de ' +
+  'qualquer read_file/list_files/edit_file/write_file, é chamar import_project_file para trazer aquele arquivo ' +
+  'pra dentro desta conversa. Isso é obrigatório mesmo que o usuário não peça explicitamente "importa esse ' +
+  'arquivo" — a simples menção ao Project com um pedido de ação sobre ele já é o gatilho. Nunca tente ler, editar ' +
+  'ou analisar um arquivo de Project sem antes importá-lo: fazer isso resulta em erro de arquivo inexistente ou ' +
+  'leitura de 0 bytes. Se o Project tiver arquivos Complementos (Workers, configs, arquivos auxiliares) que a ' +
+  'tarefa possa depender, chame import_project_file com include_complements=true na mesma chamada, pra trazer ' +
+  'tudo de uma vez. Só pule esse passo se o arquivo já existir nesta conversa (confirme com list_files se tiver ' +
+  'dúvida). ' +
   '\n\n' +
 
-  'Para pedidos que resultem em arquivos (código, scripts, sites ou apps), use a ferramenta de arquivo adequada ' +
-  'em vez de despejar um projeto grande no chat. Depois, confirme brevemente o resultado real. ' +
+  'Quando o usuário pedir para criar algo que resulte em código (um jogo, uma página, um script, etc), ' +
+  'NÃO escreva o código como texto na conversa. Em vez disso, use a ferramenta write_file (ou "cat > arquivo << ' +
+  '\'EOF\'" via run_command) para criar o arquivo. Depois de criar, apenas confirme brevemente em texto o que foi ' +
+  'feito, sem repetir o conteúdo do arquivo. ' +
   '\n\n' +
 
-  'FERRAMENTA notes: use em tarefas realmente extensas, com várias fases ou possibilidade de retomada. Registre ' +
-  'um plano curto no início e atualize em marcos relevantes; não crie notas para tarefas simples nem registre cada chamada. ' +
+  'FERRAMENTA notes: em tarefas longas que exigem várias chamadas de ferramenta em sequência (projetos grandes, ' +
+  'refatorações, várias etapas de correção), use a ferramenta notes pra anotar o plano e o progresso em vez de ' +
+  're-ler arquivos ou tentar lembrar de cabeça o que já foi feito. No início de uma tarefa complexa, escreva um ' +
+  'plano curto com notes(action="write"). Depois de cada etapa concluída, atualize com notes(action="append"). Se ' +
+  'a tarefa for retomada (ex: depois de bater o limite de ferramentas por rodada), comece lendo notes(action=' +
+  '"read") em vez de re-investigar tudo do zero. Isso evita repetir trabalho e reduz o número de rodadas ' +
+  'necessárias. Não use notes para tarefas simples de 1 ou 2 passos. ' +
   '\n\n' +
 
   'REGRA DE ARQUITETURA OBRIGATÓRIA: todo projeto web (jogos, sites, apps) deve ser entregue em UM ÚNICO ' +
@@ -220,14 +383,91 @@ function buildSystemPrompt(lang) {
   'bordas ou ícones especiais. Nunca gere um Python "sem visual" como fallback por medo desse erro — gere o ' +
   'visual de verdade, só que 100% em ASCII, pra funcionar sem quebrar. \n\n' +
 
-  'POLÍTICA DE ARQUIVOS: antes de editar um arquivo existente, confirme caminho e conteúdo atual com uma leitura ' +
-  'pertinente; não repita inspeções se o estado já estiver confirmado e não houver mudança relevante. Use sed/edit_file ' +
-  'para alterações localizadas; use write_file para arquivos novos ou mudanças estruturais/reescritas necessárias. ' +
-  'Preserve todo conteúdo fora do escopo. Faça novas edições quando um teste ou evidência concreta revelar um defeito; ' +
-  'evite apenas repetir chamadas idênticas sem motivo. Para arquivos novos, escolha nomes descritivos e únicos. Ao ' +
-  'reescrever por completo um arquivo existente via write_file, use uma versão com sufixo numérico crescente; mudanças ' +
-  'pontuais mantêm o nome. Confirme o resultado com verificações proporcionais ao risco. ' +
+  'FERRAMENTAS PARA MEXER EM ARQUIVOS — siga esta ordem de prioridade SEMPRE que o arquivo já existir:\n' +
+  '1. Pra QUALQUER alteração pontual em um arquivo que já existe (trocar uma cor, corrigir uma função, ajustar ' +
+  'um texto, adicionar um trecho pequeno), use run_command com "sed -i \'s/ANTIGO/NOVO/\' arquivo" ou "grep -n" ' +
+  'pra localizar o trecho primeiro. Isso é OBRIGATÓRIO — nunca reescreva um arquivo inteiro (write_file) só ' +
+  'pra mudar uma parte pequena dele.\n' +
+
+  '2. Se não tiver certeza do texto exato a trocar, rode primeiro "grep -n \'palavra-chave\' arquivo" ou "cat ' +
+  'arquivo" via run_command pra ver o conteúdo real antes de editar. NUNCA adivinhe o conteúdo de um arquivo ' +
+  'que já existe.\n' +
+
+  '3. write_file (reescrever o arquivo inteiro) é aceitável em três casos: (a) criação inicial de um arquivo ' +
+  'novo; (b) o usuário pedir explicitamente uma reescrita completa; ou (c) o pedido do usuário, mesmo sem pedir ' +
+  'reescrita completa, exigir uma mudança estrutural/complexa demais pra um sed -i ou edit_file pontual (ex: ' +
+  'adicionar uma feature nova que mexe em várias partes do arquivo, refatorar uma função inteira, mudar a lógica ' +
+  'de várias seções relacionadas). Nesse caso (c), write_file é a ferramenta CERTA, não errada — o que é proibido ' +
+  'não é reescrever o arquivo inteiro, e sim reescrevê-lo DIFERENTE do original. Ou seja: pra mudança pequena e ' +
+  'isolada, use run_command/sed -i; pra mudança grande/estrutural, pode e deve usar write_file, desde que siga a ' +
+  'REGRA OBRIGATÓRIA abaixo (partir do conteúdo exato do arquivo antigo, mudar só o que foi pedido).\n' +
+
+  '4. A ferramenta edit_file (old_str/new_str) também está disponível como alternativa a sed -i, mas run_command ' +
+  'é a via preferida — é o formato em que você foi mais treinado a operar.\n' +
+
+  'Antes de decidir qual ferramenta usar, pense rapidamente: "isso é uma mudança pontual em algo que já existe, ' +
+  'ou é a criação de algo novo do zero?" Mudança pontual = run_command/sed -i. Criação nova = write_file.\n\n' +
+
+  'NUNCA repita a mesma chamada de ferramenta (write_file, run_command, edit_file) mais de uma vez seguida com ' +
+  'o mesmo arquivo e o mesmo conteúdo/comando dentro da mesma resposta. Cada arquivo deve ser escrito ou editado ' +
+  'UMA ÚNICA VEZ por resposta. Se você perceber que já chamou write_file pra um arquivo e ainda não terminou de ' +
+  'pensar no conteúdo, não chame write_file de novo pra "tentar de novo" ou "corrigir" — em vez disso, planeje ' +
+  'o conteúdo completo mentalmente antes de fazer a chamada, e faça só uma chamada final por arquivo.\n\n' +
+
+  'NOMEAÇÃO DE ARQUIVOS NOVOS — REGRA OBRIGATÓRIA: toda vez que você for CRIAR um arquivo do zero (não editar um ' +
+  'que já existe), escolha você mesmo um nome novo, descritivo e específico pro conteúdo (ex: "jogo-cobrinha.html", ' +
+  '"calculadora-imc.html", "landing-produto.html"). NUNCA reaproveite o nome de um arquivo que já existe na ' +
+  'conversa (seja um arquivo que o usuário te mandou, seja um que você mesmo já criou antes), a menos que a ' +
+  'intenção clara seja editar/sobrescrever aquele arquivo específico. Reusar nome de arquivo diferente é ERRADO ' +
+  'e perigoso: quando dois arquivos de conteúdos diferentes têm o mesmo nome, um "cat"/"grep" posterior pode te ' +
+  'fazer ler ou editar o arquivo errado sem perceber, misturando pedidos de coisas diferentes. Antes de rodar ' +
+  'write_file num nome, se não tiver certeza se aquele nome já foi usado pra outra coisa, rode "ls" primeiro ' +
+  'pra conferir. Se o usuário pedir algo novo e diferente do que já existe, dê um nome novo — não pergunte, apenas ' +
+  'escolha um nome claro e siga.\n\n' +
+
+  'VERSIONAMENTO DE NOME EM REESCRITA COMPLETA — REGRA OBRIGATÓRIA: toda vez que você reescrever um arquivo que ' +
+  'já existe inteiro via write_file (casos (b) e (c) da regra 3 — pedido explícito de reescrita ou mudança ' +
+  'estrutural grande), o arquivo resultante NÃO deve ficar com o nome idêntico ao anterior. Em vez disso, ' +
+  'adicione um número sequencial logo antes da extensão, incrementando a cada nova reescrita completa daquele ' +
+  'arquivo: se o nome atual é "jogo.html", a primeira reescrita completa vira "jogo1.html"; se pedirem outra ' +
+  'reescrita completa em cima dessa, vira "jogo2.html"; e assim por diante. Se o nome atual já termina em número ' +
+  '(ex: "jogo3.html"), a próxima reescrita completa incrementa esse número (vira "jogo4.html"), nunca reinicia. ' +
+  'O motivo: cada reescrita completa gera uma entrega separada na conversa, e se duas entregas diferentes tiverem ' +
+  'exatamente o mesmo nome, isso confunde qual delas é a mais recente/correta ao consultar o histórico depois — ' +
+  'com números diferentes fica impossível confundir uma com a outra. IMPORTANTE: essa regra de numerar vale só ' +
+  'pra reescrita COMPLETA via write_file num arquivo que já existia. Edições pontuais via run_command/sed -i ou ' +
+  'edit_file continuam alterando o arquivo original no mesmo nome, sem numerar — não são uma "nova entrega", é o ' +
+  'mesmo arquivo sendo ajustado no lugar. Depois de renomear, ao continuar a conversa, o arquivo "atual" pra ' +
+  'qualquer novo pedido passa a ser o do nome mais recente/mais numerado — confirme sempre com "ls" se tiver ' +
+  'dúvida de qual é a versão mais nova.\n\n' +
+
+  'REGRA OBRIGATÓRIA PRA QUANDO A REESCRITA COMPLETA (write_file) FOR A OPÇÃO CERTA NUM ARQUIVO QUE JÁ EXISTE: ' +
+  'isso vale nos casos (b) e (c) da regra 3 acima — pedido explícito de reescrita completa, ou mudança grande/' +
+  'estrutural demais pra edição pontual. Nesses casos, você SEMPRE deve partir do conteúdo EXATO do arquivo ' +
+  'antigo (visto via cat/grep recente nesta janela de contexto) e reescrevê-lo aplicando SOMENTE as melhorias/ ' +
+  'mudanças que o usuário pediu. O que é proibido não é usar write_file — é usar write_file pra gerar um arquivo ' +
+  'PARALELO/DIFERENTE do original. Nunca gere uma versão nova "do seu jeito", reorganizada, reescrita com outra ' +
+  'estrutura, outros nomes de variável/função, outro estilo de código, comentários removidos/reescritos, ou ' +
+  'qualquer trecho reformulado que o usuário não pediu pra mexer. Todo o resto do arquivo (código, comentários, ' +
+  'formatação, ordem, nomes) deve permanecer IDÊNTICO ao original — igual a um diff limpo, onde só as linhas ' +
+  'relacionadas ao pedido do usuário mudam. Se em algum momento você notar que está "recriando" o arquivo de ' +
+  'memória ou do seu próprio estilo em vez de copiar o conteúdo real visto no cat/grep, pare e rode "cat" no ' +
+  'arquivo de novo antes de continuar.\n\n' +
+
+  'Você tem um orçamento de tokens grande disponível para a resposta. Nunca entregue uma versão resumida, ' +
+  'simplificada ou incompleta de um jogo/app por achar que está "economizando espaço" — isso é sempre errado. ' +
+  'Se o pedido envolve código (jogo, app, site), sua resposta final DEVE ser uma chamada de write_file com o ' +
+  'arquivo completo, nunca texto corrido com trechos de código, não importa o tamanho do arquivo.' +
   '\n\n' +
+
+  'ATENÇÃO — CONVERSAS LONGAS: em uma conversa com muitas mensagens, você só enxerga as últimas trocas; o ' +
+  'início pode ter saído da sua janela de contexto. Por isso, se o usuário pedir uma alteração num arquivo e ' +
+  'você não tiver, NESTA janela de contexto, o conteúdo atual e completo desse arquivo a partir de um cat/grep ' +
+  'recente, ISSO NÃO SIGNIFICA que o arquivo não existe ou está vazio — significa apenas que você não viu o ' +
+  'conteúdo dele ainda. Nunca conclua "não tenho esse arquivo no histórico, então vou criar do zero". Rode ' +
+  '"ls" pra confirmar se o arquivo existe e "cat"/"grep" pra ver o conteúdo real ANTES de qualquer write_file ' +
+  'ou edição. Reescrever completamente (write_file) um arquivo que já existe é permitido nos casos (b) e (c) ' +
+  'da regra 3 — não é restrito só a pedido explícito de reescrita total.\n\n' +
 
   'FERRAMENTA redacao — QUANDO O USUÁRIO PEDIR UMA REDAÇÃO: sempre que o usuário pedir pra você escrever uma ' +
   'redação, dissertação, texto dissertativo-argumentativo ou algo equivalente (ex: "faz uma redação sobre...", ' +
@@ -276,10 +516,61 @@ function buildSystemPrompt(lang) {
   'é melhor pra dado estruturado direto da fonte. Não anuncie que vai usar a ferramenta nem explique o processo de ' +
   'busca ao usuário; apenas chame e use o resultado naturalmente na resposta.\n\n' +
 
-  'FERRAMENTA screenshot_html: use para conferir uma interface criada/alterada de forma relevante ou diagnosticar ' +
-  'um problema visual. Use selector para isolar a área alterada; faça versões mobile/desktop quando a responsividade ' +
-  'for pertinente. Combine screenshot com test_html_sandbox quando houver lógica executável: um print é estático e não ' +
-  'comprova funcionamento. Não repita prints sem mudança e nunca diga que conferiu o visual sem realmente analisar o resultado.\n\n'
+  'FERRAMENTA screenshot_html — SEUS OLHOS PARA CONFERIR O VISUAL: se esta ferramenta estiver disponível, ela ' +
+  'tira um print REAL de um arquivo .html/.htm do projeto, renderizado de verdade num navegador isolado, e a ' +
+  'imagem chega pra você numa mensagem logo depois do resultado da ferramenta, começando com "TATO_SCREENSHOT:". ' +
+  'Essa mensagem NÃO é do usuário: é o print que você mesmo pediu. Olhe a imagem de verdade e só depois decida ' +
+  'o próximo passo. O resultado em texto também traz um resumo: tamanho da tela e da página, aviso de rolagem ' +
+  'horizontal, elementos que passam da borda direita e o texto visível.\n' +
+  'PARÂMETROS: path (obrigatório, o .html); selector (opcional, seletor CSS da parte que você quer ver, ex: ' +
+  '"#barra-escrever" ou ".cabecalho" — o print mostra só aquele elemento); device ("mobile" = 390x844, padrão, ou ' +
+  '"desktop" = 1280x800); width/height (opcionais, em px, sobrescrevem o device); full_page (true = página inteira ' +
+  'com rolagem, até 4000px de altura).\n' +
+  'QUANDO USAR — de forma PROATIVA, sem o usuário precisar pedir:\n' +
+  '(a) Assim que você terminar qualquer coisa visual (tela, layout, menu, card, botão, barra, formulário, jogo, ' +
+  'landing page), tire um print pra conferir antes de dar a tarefa como concluída.\n' +
+  '(b) Depois de qualquer ajuste visual (alinhamento, cor, tamanho, espaçamento, ícone, algo cortado, sobreposto ou ' +
+  'fora do lugar, responsividade): confirme com um print que ficou como o usuário pediu.\n' +
+  '(c) Quando o usuário relatar um bug visual ("tá cortado", "tá sobrepondo", "ficou torto"): veja o print ANTES de ' +
+  'editar, para achar a causa real em vez de adivinhar pelo código, e tire outro DEPOIS de corrigir.\n' +
+  '(d) NO MEIO DA CONSTRUÇÃO, sem esperar o arquivo ficar completo: em arquivos grandes ou feitos em etapas, monte ' +
+  'o esqueleto ou uma seção, tire print (use selector pra ver só aquela parte) e siga adiante. Basta o arquivo ser ' +
+  'um HTML que carregue. Conferir cada parte enquanto constrói evita descobrir tudo quebrado só no final.\n' +
+  '(e) Se o layout é responsivo ou o usuário usa celular e PC, tire um print de device "mobile" e outro de "desktop".\n' +
+  'COMO USAR BEM: prefira selector pra conferir só a parte que você mexeu (a imagem fica mais nítida); use full_page ' +
+  'só para uma visão geral. Ordem ideal: write_file/edit_file → test_html_sandbox (erros de execução) → ' +
+  'screenshot_html (visual) → corrija o que viu → confirme de novo. Uma ferramenta não substitui a outra.\n' +
+  'COMO ANALISAR O PRINT: procure texto cortado ou ilegível, elementos sobrepostos, alinhamento e espaçamento ' +
+  'errados, contraste ruim, coisas fora da borda da tela e partes que deveriam aparecer e não aparecem. Print ' +
+  'totalmente branco ou vazio costuma indicar erro de JavaScript, seletor errado ou conteúdo que só aparece depois ' +
+  'de uma ação — confira o resumo em texto e rode test_html_sandbox.\n' +
+  'LIMITAÇÕES (não confunda com bug do código): o print é estático e mostra o estado inicial da página logo após ' +
+  'carregar — sem cliques, hover ou teclado, animações congeladas num instante e jogos mostrando só a tela inicial. ' +
+  'Imagens e fontes de URLs externas podem não aparecer. O armazenamento local começa zerado. Por isso, não use o ' +
+  'print para provar que a LÓGICA funciona; para isso use test_html_sandbox e leitura do código.\n' +
+  'DISCIPLINA: não tire prints repetidos sem ter mudado nada entre eles; se após uns 3 ciclos de ajuste o problema ' +
+  'visual persistir, explique ao usuário o que você viu e o que tentou. Não use a ferramenta em tarefas sem parte ' +
+  'visual (backend, scripts, texto puro, Python). Se o resultado vier com FALHOU, leia o motivo (seletor ' +
+  'inexistente? arquivo não salvo?), corrija e tente de novo. Só o print mais recente fica visível pra você; os ' +
+  'antigos viram texto, então, se precisar comparar, anote o que viu. Não narre "vou tirar um print": apenas chame ' +
+  'a ferramenta. Na resposta final, diga em uma ou duas frases o que conferiu e corrigiu. NUNCA diga que viu ou ' +
+  'conferiu o visual sem ter de fato chamado a ferramenta e analisado a imagem.\n\n' +
+
+  'IMPORTANTE — NÃO CONFUNDA PEDIDO DE IMAGEM COM PEDIDO DE CÓDIGO: um pedido como "crie uma imagem", "gere uma foto", ' +
+  '"faça uma ilustração", "desenhe" ou equivalente, quando a intenção é obter uma imagem visual, é um pedido de imagem, ' +
+  'não um pedido para programar uma representação da imagem. Nesses casos, siga EXCLUSIVAMENTE as regras do estado de ' +
+  'imagem fornecido no contexto desta requisição. Se a geração não estiver disponível, não tente criar um HTML para ' +
+  'representá-la. Nunca transforme um pedido de imagem em um projeto HTML só porque o pedido contém palavras como ' +
+  '"desenhar", "criar", "visualizar" ou "mostrar".\n\n' +
+
+  'ATENÇÃO — QUAL É A VERSÃO "ATUAL" DO ARQUIVO: se você mesmo editou um arquivo mais cedo nesta conversa (via ' +
+  'write_file, sed -i ou edit_file), e o usuário em seguida pede pra ajustar/corrigir mais alguma coisa nesse ' +
+  'mesmo arquivo, o ponto de partida é SEMPRE o estado do arquivo DEPOIS da sua última edição — nunca a versão ' +
+  'de antes (seja a que o usuário mandou originalmente, seja uma versão intermediária). Não presuma de memória ' +
+  'qual é o conteúdo atual mesmo que você mesmo tenha acabado de escrevê-lo: antes de aplicar a próxima mudança, ' +
+  'rode "cat"/"grep" no arquivo de novo pra confirmar o estado real em disco (sua última escrita pode ter sido ' +
+  'diferente do que você "lembra" ter escrito). Trate cada pedido novo de alteração como incidindo sobre o ' +
+  'resultado da edição anterior, em cadeia — nunca volte a trabalhar em cima da versão original/pré-edição.'
   );
 }
 
@@ -288,29 +579,34 @@ function buildSystemPrompt(lang) {
 // LEMBRETE DE ARQUIVOS
 // ============================================================
 
-// Este lembrete curto só é anexado quando a mensagem recente indica trabalho com arquivos.
+// Esse lembrete é reenviado no FINAL da lista de mensagens em TODA
+// requisição (depois de todo o histórico da conversa), não só uma vez lá.
+// Motivo: em conversas longas, o system prompt original fica "distante"
+// no momento em que o modelo decide o próximo passo.
 const FILE_REMINDER =
-  'ARQUIVOS: para editar, use o conteúdo atual verificado e preserve tudo o que não foi solicitado. Evite reler sem motivo se o estado não mudou.';
+  'LEMBRETE CRÍTICO SOBRE ARQUIVOS (siga isso agora, não só o que estava no system prompt lá no início): ' +
+  '(1) Antes de mexer em QUALQUER arquivo que já existe — seja pra editar pontualmente ou reescrever inteiro — ' +
+  'rode "ls" e depois "cat"/"grep" pra confirmar o nome exato e o conteúdo REAL do arquivo AGORA, mesmo que você ' +
+  'ache que já sabe (sua "lembrança" pode estar desatualizada ou ser de um arquivo diferente com nome parecido). ' +
+  'Nunca edite ou analise um arquivo baseado só no que apareceu antes na conversa sem reconferir. ' +
+  '(2) Se a ação certa for reescrever um arquivo já existente por completo (write_file), o nome do arquivo NOVO ' +
+  'tem que ser diferente do nome atual: adicione um número antes da extensão, incrementando a partir do que já ' +
+  'existir (ex: "jogo.html" existente → escreva "jogo1.html"; se já existir "jogo1.html" → escreva "jogo2.html"). ' +
+  'NUNCA escreva um write_file usando exatamente o mesmo nome que um arquivo que já existe na conversa. ' +
+  '(3) Se a ação for só um ajuste pontual (sed -i/edit_file) no arquivo, aí sim o nome continua o mesmo — não ' +
+  'numera edição pontual, só reescrita completa.';
 
-function userTextForPolicy(message) {
-  if (!message || message.role !== 'user') return '';
-  if (typeof message.content === 'string') return message.content;
-  if (Array.isArray(message.content)) return message.content
-    .filter(function(part){ return part && part.type === 'text' && typeof part.text === 'string'; })
-    .map(function(part){ return part.text; }).join(' ');
-  return '';
-}
 
-function shouldAttachFileReminder(history) {
-  if (!Array.isArray(history)) return false;
-  const recentUserTexts = history.filter(function(message){ return message && message.role === 'user'; })
-    .slice(-5).map(userTextForPolicy);
-  if (!recentUserTexts.length) return false;
-  const latest = recentUserTexts[recentUserTexts.length - 1] || '';
-  const hasWorkIntent = /\b(crie|criar|faca|faça|edite|editar|corrija|corrigir|conserte|consertar|altere|alterar|modifique|modificar|implemente|implementar|adicione|adicionar|construa|construir|desenvolva|desenvolver|teste|testar|refatore|refatorar|reescreva|reescrever|melhore|melhorar|ajuste|ajustar|arruma|arrumar|muda|mudar|resolve|resolver|debug|corrige|continua|continue|aplique|aplicar)\b/i.test(latest);
-  if (!hasWorkIntent) return false;
-  const fileContextRe = /\b(arquivo|arquivos|codigo|código|script|programa|projeto|site|app|aplicativo|jogo|html|css|javascript|typescript|python|node\.js|funcao|função|bug|erro|terminal|tatoEOF|grep|sed|commit|deploy|pagina|página)\b/i;
-  return recentUserTexts.some(function(text){ return fileContextRe.test(text); });
+// ============================================================
+// LEMBRETE DE IDIOMA
+// ============================================================
+
+function buildLangReminder(lang) {
+  if (lang === 'en-US') {
+    return 'LANGUAGE REMINDER: reply in English (en-US) now, regardless of the language used earlier in this conversation.';
+  }
+
+  return 'LEMBRETE DE IDIOMA: responda agora em português do Brasil, independentemente do idioma usado antes nesta conversa.';
 }
 
 
@@ -1002,11 +1298,8 @@ app.post(
 
     // Este worker é o backend do Tato 4.1.
     const modelMode = 'tato-4.1';
-    const reasoningEnabled = !!(body && body.reasoning_enabled === true);
-    // O botão escolhe um modo real de inferência: o modelo atual com raciocínio
-    // completo ou o modelo multimodal de execução rápida com reasoning_effort=none.
-    const requestModel = reasoningEnabled ? MODEL : MODEL_FAST;
-    const requestMaxTokens = reasoningEnabled ? MAX_TOKENS_STANDARD : MAX_TOKENS_FAST;
+    const requestMaxTokens = MAX_TOKENS_STANDARD;
+    const reasoningEnabled = REASONING_ENABLED;
 
 
     const imageContext =
@@ -1018,7 +1311,7 @@ app.post(
 
     const payload = {
       model:
-        requestModel,
+        MODEL,
 
       messages:
         [
@@ -1027,7 +1320,10 @@ app.post(
               'system',
 
             content:
-              buildSystemPrompt(lang)
+              buildSystemPrompt(
+                lang,
+                imageContext
+              )
           }
         ]
         .concat(
@@ -1035,7 +1331,13 @@ app.post(
         )
         .concat(
           [
-            ...(shouldAttachFileReminder(history) ? [{ role: 'system', content: FILE_REMINDER }] : []),
+            {
+              role:
+                'system',
+
+              content:
+                FILE_REMINDER
+            },
 
             {
               role:
@@ -1043,6 +1345,16 @@ app.post(
 
               content:
                 buildDateReminder(
+                  lang
+                )
+            },
+
+            {
+              role:
+                'system',
+
+              content:
+                buildLangReminder(
                   lang
                 )
             },
@@ -1080,11 +1392,14 @@ app.post(
 
       temperature: 0.2,
 
-      // Pensar Mais usa o template original do Step 5. No modo rápido, usamos
-      // o controle oficialmente suportado pelo Nemotron: reasoning_effort=none.
-      ...(reasoningEnabled
-        ? { chat_template_kwargs: { enable_thinking: true, preserve_thinking: true } }
-        : { reasoning_effort: 'none' }),
+      // Reasoning somente por ligado/desligado.
+      // Neste backend ele fica permanentemente ligado.
+      chat_template_kwargs: {
+        enable_thinking:
+          reasoningEnabled,
+        preserve_thinking:
+          true
+      },
 
       stream:
         true
@@ -1418,6 +1733,23 @@ app.post(
     }
 
 
+    req.on(
+      'close',
+      function () {
+        closed =
+          true;
+
+        if (reader) {
+          try {
+            reader.cancel();
+          } catch (e) {
+            // ignora
+          }
+        }
+      }
+    );
+
+
     const heartbeatId =
       setInterval(
         ping,
@@ -1438,27 +1770,6 @@ app.post(
         },
         FETCH_TIMEOUT_MS
       );
-
-
-    // O evento "close" de IncomingMessage (req) pode ocorrer assim que o
-    // corpo do POST termina de ser lido. Não o use para encerrar um SSE longo:
-    // isso interrompia respostas válidas no meio e aparecia no frontend como
-    // "network error". A vida do stream do cliente é acompanhada pelo res.
-    res.on('close', function () {
-      // O close emitido depois de res.end() é normal; só cancela se o cliente
-      // realmente desconectou antes de o servidor terminar a resposta.
-      if (res.writableEnded || closed) return;
-      closed = true;
-      clearInterval(heartbeatId);
-      clearTimeout(timeoutId);
-      if (reader) {
-        try {
-          Promise.resolve(reader.cancel()).catch(function () {});
-        } catch (e) {
-          // o stream já pode estar cancelado
-        }
-      }
-    });
 
 
     // ==========================================================
@@ -1738,14 +2049,12 @@ app.post(
               '';
 
             if (reasoningPiece) {
-              // Preserve o contexto de reasoning para a continuidade de tool calls,
-              // mas só exiba a trilha de pensamento quando "Pensar Mais" estiver ativo.
+              // Para o Tato 4.1, envie cada fragmento de reasoning assim que
+              // chegar. Isso reproduz o comportamento de streaming do modelo.
+              pendingThinking += reasoningPiece;
               reasoningContentAcc += reasoningPiece;
               registerThinking(reasoningPiece);
-              if (reasoningEnabled) {
-                pendingThinking += reasoningPiece;
-                flushPending();
-              }
+              flushPending();
             }
 
 
@@ -1763,13 +2072,18 @@ app.post(
                 );
 
 
-              if (parts.thinking) {
-                reasoningContentAcc += parts.thinking;
+              if (
+                parts.thinking
+              ) {
+
+                pendingThinking +=
+                  parts.thinking;
+
+                reasoningContentAcc +=
+                  parts.thinking;
+
                 registerThinking(parts.thinking);
-                if (reasoningEnabled) {
-                  pendingThinking += parts.thinking;
-                  scheduleFlush();
-                }
+                scheduleFlush();
               }
 
 
@@ -2111,9 +2425,8 @@ app.post(
 
             ?
 
-          'A IA atingiu o limite de saída desta requisição (' +
-          requestMaxTokens.toLocaleString('pt-BR') +
-          ' tokens) antes de concluir a resposta.'
+          'A IA gastou todo o limite de tokens pensando e não sobrou espaço para a resposta visível. ' +
+          'O Tato 4.1 está com reasoning ativado e o limite é 256K tokens.'
 
             :
 
