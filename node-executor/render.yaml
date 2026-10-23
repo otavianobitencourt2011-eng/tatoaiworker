@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: tatoaiworker-node
+    runtime: docker
+    plan: starter          # o plano free dorme e tem pouca RAM; starter ou maior é recomendado
+    healthCheckPath: /health
+    envVars:
+      - key: FIREBASE_PROJECT_ID
+        value: tatoiapro
+      - key: TATO_ALLOWED_ORIGINS
+        value: https://SEU-DOMINIO-DO-TATO     # origem(ns) do HTML, separadas por vírgula
+      - key: TATO_MAX_CONCURRENCY
+        value: "2"
