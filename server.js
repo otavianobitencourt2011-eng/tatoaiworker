@@ -28,7 +28,14 @@ const FLUSH_MS = 60;
 // O reasoning não usa mais níveis: fica apenas ligado/desligado
 // e neste backend fica FORÇADO como ligado.
 const MAX_TOKENS_STANDARD = 262144;
-const REASONING_ENABLED = true;
+const REASONING_ENABLED = true; // legado: agora quem decide é decideThinking()
+
+// ---- CONTROLE DE RACIOCÍNIO ----
+// Variável opcional no Render: THINKING_MODE = auto (padrão) | on | off
+const THINKING_MODE = String(process.env.THINKING_MODE || 'auto').toLowerCase();
+// Orçamento em CARACTERES (≈ 4 por token). Estourou sem responder → corta e refaz sem pensar.
+const THINK_BUDGET_NORMAL = Number(process.env.THINK_BUDGET_NORMAL) || 12000;   // ≈ 3k tokens
+const THINK_BUDGET_COMPLEX = Number(process.env.THINK_BUDGET_COMPLEX) || 36000;  // ≈ 9k tokens
 
 // Limite único de tamanho de arquivo no backend.
 const MAX_FILE_BYTES_STANDARD = 1 * 1024 * 1024;
@@ -1143,6 +1150,61 @@ function makeThinkFilter() {
 
 
 // ============================================================
+// CONTROLE DE RACIOCÍNIO (adaptativo + orçamento)
+// ============================================================
+
+function normalizeText(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+
+function lastMessageInfo(history) {
+  const last = history[history.length - 1];
+  let text = '';
+  let hasImage = false;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m && m.role === 'user') {
+      if (typeof m.content === 'string') text = m.content;
+      else if (Array.isArray(m.content)) {
+        text = m.content.filter(function (p) { return p && p.type === 'text'; })
+          .map(function (p) { return p.text; }).join('\n');
+        hasImage = m.content.some(function (p) { return p && p.type === 'image_url'; });
+      }
+      break;
+    }
+  }
+  return { text: text, hasImage: hasImage, lastRole: last ? last.role : '' };
+}
+
+const COMPLEX_RE = /(refator|arquitet|debug|depur|otimiz|algoritm|migra[cr]|seguranc|desempenho|banco de dados|sistema completo|do zero|passo a passo|demonstr|prove|equacao|integral|derivada)/;
+const WORK_RE = /(codigo|code|bug|erro|error|arquivo|file|html|css|script|funcao|function|implement|corrig|conserta|ajust|crie|criar|gere|gerar|jogo|app\b|site|projeto|sistema|calcul|analis|compar|explique|explica)/;
+
+function decideThinking(history) {
+  if (THINKING_MODE === 'off') return { enabled: false, budget: 0, level: 'off' };
+  if (THINKING_MODE === 'on') return { enabled: true, budget: Infinity, level: 'on' };
+  const info = lastMessageInfo(history);
+  const t = normalizeText(info.text);
+  if (info.lastRole === 'tool') return { enabled: true, budget: THINK_BUDGET_NORMAL, level: 'normal' };
+  if (COMPLEX_RE.test(t) || t.length > 1500) return { enabled: true, budget: THINK_BUDGET_COMPLEX, level: 'complex' };
+  if (info.hasImage || WORK_RE.test(t) || t.length > 240) return { enabled: true, budget: THINK_BUDGET_NORMAL, level: 'normal' };
+  return { enabled: false, budget: 0, level: 'simple' };
+}
+
+function buildThinkingReminder(lang) {
+  if (lang === 'en-US') {
+    return 'REASONING POLICY (follow now): think only as much as needed, then PRODUCE. Pick one approach in a few lines and execute it; ' +
+      'do not reopen decisions already made, do not alternate between equivalent options, do not re-read the request repeatedly. ' +
+      'For simple requests answer directly without deliberating. For code, write the complete, consistent solution on the first pass; ' +
+      're-analyze only if a tool returns a real error.';
+  }
+  return 'POLÍTICA DE RACIOCÍNIO (siga agora): pense só o necessário e PRODUZA. Escolha uma abordagem em poucas linhas e execute; ' +
+    'não reabra decisões já tomadas, não alterne entre opções equivalentes e não releia o pedido várias vezes. ' +
+    'Em pedidos simples, responda direto, sem deliberar. Em código, escreva a solução completa e consistente na primeira passada; ' +
+    'só reanalise se uma ferramenta devolver um erro real.';
+}
+
+
+// ============================================================
 // EXPRESS
 // ============================================================
 
@@ -1299,7 +1361,10 @@ app.post(
     // Este worker é o backend do Tato 4.1.
     const modelMode = 'tato-4.1';
     const requestMaxTokens = MAX_TOKENS_STANDARD;
-    const reasoningEnabled = REASONING_ENABLED;
+    const thinkDecision = decideThinking(history);
+    const reasoningEnabled = thinkDecision.enabled;
+    let thinkingCutDone = false;
+    console.log('[Tato 4.1] raciocínio:', thinkDecision.level, '| orçamento:', thinkDecision.budget);
 
 
     const imageContext =
@@ -1369,6 +1434,11 @@ app.post(
                   imageContext,
                   tools
                 )
+            },
+
+            {
+              role: 'system',
+              content: buildThinkingReminder(lang)
             },
 
             ...(explicitGithubRequest && hasGithubTool
@@ -1787,6 +1857,8 @@ app.post(
 
     for (let emptyAttempt = 0; ; emptyAttempt++) {
 
+      let budgetCut = false;
+
       const think =
         makeThinkFilter();
 
@@ -2055,6 +2127,17 @@ app.post(
               reasoningContentAcc += reasoningPiece;
               registerThinking(reasoningPiece);
               flushPending();
+
+              if (
+                !thinkingCutDone &&
+                !contentAcc &&
+                !toolCallsAcc.length &&
+                reasoningContentAcc.length > thinkDecision.budget
+              ) {
+                budgetCut = true;
+                try { reader.cancel(); } catch (e) { /* ignora */ }
+                break;
+              }
             }
 
 
@@ -2230,6 +2313,29 @@ app.post(
         finish();
 
         return;
+      }
+
+
+      if (budgetCut) {
+        thinkingCutDone = true;
+        flushPending();
+        console.warn('[Tato 4.1] Orçamento de raciocínio estourado (' + reasoningContentAcc.length + ' chars) — refazendo sem raciocínio.');
+        payload.chat_template_kwargs.enable_thinking = false;
+        payload.messages.push({
+          role: 'system',
+          content: lang === 'en-US'
+            ? 'You have already reflected enough. Act now, directly: call the needed tool or write the final answer. Do not deliberate further.'
+            : 'Você já refletiu o suficiente. Aja agora, direto: chame a ferramenta necessária ou escreva a resposta final. Não delibere mais.'
+        });
+        const cutRetry = await requestUpstreamWithRetry();
+        if (cutRetry.fatal || !cutRetry.upstream) {
+          send({ type: 'error', error: 'Server sobrecarregado, tente novamente mais tarde.' });
+          finish();
+          return;
+        }
+        upstream = cutRetry.upstream;
+        emptyAttempt--; // não gasta uma das tentativas de "resposta vazia"
+        continue;
       }
 
 
