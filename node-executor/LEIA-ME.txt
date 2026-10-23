@@ -1,0 +1,5 @@
+ORDEM:
+1) TatoNodeExecutor/  -> sobe no GitHub numa subpasta (ex.: node-executor/) do repo tatoaiworker, SEM mexer no server.js da raiz.
+   No Render: Root Directory = node-executor, runtime Docker. Abra /health e confira allowed:true.
+2) index_tato_activity_cmd_labels.html -> seu HTML do Tato. Troque TATO_NODE_EXECUTOR_DEFAULT_URL pela URL do executor.
+3) testes_html/ -> so para testar, nao precisa subir.
