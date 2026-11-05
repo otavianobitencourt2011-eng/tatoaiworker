@@ -1,5 +1,5 @@
 // tato-flash-worker.js — segundo worker de IA do Tato
-// Modelo: Agnes 2.5 Flash. Mesma chave da Agnes, guardada só como
+// Modelo: Agnes 3 Flash. Mesma chave da Agnes, guardada só como
 // env var no Render (AGNES_API_KEY) — nunca hardcoded aqui.
 
 const express = require('express');
