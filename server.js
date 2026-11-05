@@ -8,14 +8,16 @@
 // Variável de ambiente necessária no Render (aba "Environment"):
 //   NVIDIA_API_KEY = ...
 // API OpenAI-compatible da NVIDIA (integrate.api.nvidia.com, endpoint
-// /v1/chat/completions) usando o modelo Step 5 Preview (stepfun-ai/step-5-preview).
+// /v1/chat/completions) usando o modelo Nemotron 3.5 Super VL
+// (nvidia/nemotron-3.5-super-vl-120b-a12b) — 120B total / 12B ativos,
+// contexto de até 1M tokens, entrada de texto + imagem.
 // ============================================================
 
 import express from 'express';
 
 const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
-// ID confirmado na NVIDIA Build: stepfun-ai/step-5-preview.
-const MODEL = 'stepfun-ai/step-5-preview';
+// ID confirmado na NVIDIA Build: nvidia/nemotron-3.5-super-vl-120b-a12b.
+const MODEL = 'nvidia/nemotron-3.5-super-vl-120b-a12b';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -23,19 +25,33 @@ const FETCH_TIMEOUT_MS = 1200000; // 20 minutos (era 5 min — cortava em respos
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
 
-// Tato 4.1 agora roda sobre Step 5 Preview (via NVIDIA). O limite de saída
-// foi aumentado para 256K tokens.
-// O reasoning não usa mais níveis: fica apenas ligado/desligado
-// e neste backend fica FORÇADO como ligado.
-const MAX_TOKENS_STANDARD = 262144;
-const REASONING_ENABLED = true; // legado: agora quem decide é decideThinking()
+// Tato 4.1 agora roda sobre Nemotron 3.5 Super VL (via NVIDIA).
+// Limite de saída: 320K tokens (o modelo tem janela de 1M).
+// Se o endpoint da NVIDIA recusar esse valor, o servidor tenta de novo
+// sozinho com um limite menor (ver MAX_TOKENS_FALLBACK).
+const MAX_TOKENS_STANDARD = 320000;
+const MAX_TOKENS_FALLBACK = [131072, 65536];
 
 // ---- CONTROLE DE RACIOCÍNIO ----
+// Esforço ALTO (high) do Nemotron 3.5: enable_thinking: true + medium_effort: false.
+// A decisão de ligar ou não continua adaptativa (decideThinking):
+//   - pedido simples ("oi", conversa curta) → raciocínio DESLIGADO
+//   - pedido normal (código, arquivos, projeto simples) → até 8K tokens de raciocínio
+//   - pedido complexo (arquitetura, debug, refatoração...) → até 50K tokens de raciocínio
+// Estourou o orçamento sem começar a responder → corta e refaz sem pensar.
 // Variável opcional no Render: THINKING_MODE = auto (padrão) | on | off
 const THINKING_MODE = String(process.env.THINKING_MODE || 'auto').toLowerCase();
-// Orçamento em CARACTERES (≈ 4 por token). Estourou sem responder → corta e refaz sem pensar.
-const THINK_BUDGET_NORMAL = Number(process.env.THINK_BUDGET_NORMAL) || 12000;   // ≈ 3k tokens
-const THINK_BUDGET_COMPLEX = Number(process.env.THINK_BUDGET_COMPLEX) || 36000;  // ≈ 9k tokens
+const THINK_BUDGET_NORMAL_TOKENS = Number(process.env.THINK_BUDGET_NORMAL_TOKENS) || 8000;
+const THINK_BUDGET_COMPLEX_TOKENS = Number(process.env.THINK_BUDGET_COMPLEX_TOKENS) || 50000;
+// Estimativa: ~4 caracteres por token.
+const CHARS_PER_TOKEN = 4;
+
+// Recomendação oficial da NVIDIA para o Nemotron 3.5 Super VL.
+const TEMPERATURE = 1.0;
+const TOP_P = 0.95;
+
+// Limite de imagens por requisição aceito pelo Nemotron 3.5 Super VL.
+const MAX_IMAGES_PER_REQUEST = 4;
 
 // Limite único de tamanho de arquivo no backend.
 const MAX_FILE_BYTES_STANDARD = 1 * 1024 * 1024;
@@ -62,32 +78,25 @@ function languageDirective(lang) {
 // CONTEXTO DO MODO IMAGEM
 // ============================================================
 
+function toolNames(tools) {
+  return (Array.isArray(tools) ? tools : [])
+    .map(function (tool) {
+      return tool && tool.function && tool.function.name ? String(tool.function.name) : '';
+    })
+    .filter(Boolean);
+}
+
 function normalizeImageContext(body, tools) {
   const explicit = body && body.image_context;
 
   if (explicit && typeof explicit === 'object') {
     const state = String(explicit.state || '').trim();
-
-    if (
-      state === 'guest' ||
-      state === 'authenticated_off' ||
-      state === 'authenticated_on'
-    ) {
+    if (state === 'guest' || state === 'authenticated_off' || state === 'authenticated_on') {
       return { state };
     }
   }
 
-  const names = (Array.isArray(tools) ? tools : [])
-    .map(function (tool) {
-      return (
-        tool &&
-        tool.function &&
-        tool.function.name
-          ? String(tool.function.name)
-          : ''
-      );
-    })
-    .filter(Boolean);
+  const names = toolNames(tools);
 
   /*
    * Fallback:
@@ -99,21 +108,9 @@ function normalizeImageContext(body, tools) {
    * ask_image aparece quando:
    * - o modo imagem está desligado
    */
-  if (names.includes('imagecreator')) {
-    return {
-      state: 'authenticated_on'
-    };
-  }
-
-  if (names.includes('ask_image')) {
-    return {
-      state: 'authenticated_off'
-    };
-  }
-
-  return {
-    state: 'unknown'
-  };
+  if (names.includes('imagecreator')) return { state: 'authenticated_on' };
+  if (names.includes('ask_image')) return { state: 'authenticated_off' };
+  return { state: 'unknown' };
 }
 
 
@@ -121,71 +118,33 @@ function normalizeImageContext(body, tools) {
 // LEMBRETE FINAL DE IMAGEM
 // ============================================================
 
-function buildImageReminder(
-  lang,
-  imageContext,
-  tools
-) {
-  const state =
-    imageContext &&
-    imageContext.state
-      ? imageContext.state
-      : 'unknown';
-
-  const names =
-    (Array.isArray(tools) ? tools : [])
-      .map(function (tool) {
-        return (
-          tool &&
-          tool.function &&
-          tool.function.name
-            ? String(
-                tool.function.name
-              )
-            : ''
-        );
-      })
-      .filter(Boolean);
-
-  const hasCreator =
-    names.includes(
-      'imagecreator'
-    );
-
-  const hasAsk =
-    names.includes(
-      'ask_image'
-    );
-
+function buildImageReminder(lang, imageContext, tools) {
+  const state = imageContext && imageContext.state ? imageContext.state : 'unknown';
+  const names = toolNames(tools);
+  const hasCreator = names.includes('imagecreator');
+  const hasAsk = names.includes('ask_image');
 
   if (lang === 'en-US') {
-
     if (state === 'guest') {
       return (
         'IMAGE ACCESS REMINDER: this user is NOT signed in with Google. ' +
         'Image creation is unavailable. Never replace an image request with ' +
         'HTML, SVG, canvas, code, or a textual simulation. ' +
-        (
-          hasAsk
-            ? 'Use ask_image to tell the user Google login is required.'
-            : 'Tell the user directly that Google login is required.'
-        )
+        (hasAsk
+          ? 'Use ask_image to tell the user Google login is required.'
+          : 'Tell the user directly that Google login is required.')
       );
     }
-
 
     if (state === 'authenticated_off') {
       return (
         'IMAGE MODE REMINDER: the user is signed in with Google, but image mode is OFF. ' +
         'Never replace an image request with HTML, SVG, canvas, or code. ' +
-        (
-          hasAsk
-            ? 'Use ask_image to ask whether image mode may be enabled.'
-            : 'Tell the user that image mode must be enabled.'
-        )
+        (hasAsk
+          ? 'Use ask_image to ask whether image mode may be enabled.'
+          : 'Tell the user that image mode must be enabled.')
       );
     }
-
 
     if (state === 'authenticated_on') {
       return (
@@ -196,7 +155,6 @@ function buildImageReminder(
       );
     }
 
-
     return (
       'IMAGE REMINDER: never replace a real image-generation request with ' +
       'HTML/SVG/canvas/code. Use the dedicated image tool when available; ' +
@@ -204,33 +162,26 @@ function buildImageReminder(
     );
   }
 
-
   if (state === 'guest') {
     return (
       'LEMBRETE DE ACESSO A IMAGENS: este usuário NÃO está logado com uma conta Google. ' +
       'A criação de imagens está indisponível. Nunca substitua uma imagem por ' +
       'HTML, SVG, canvas, código ou simulação textual. ' +
-      (
-        hasAsk
-          ? 'Use ask_image para informar que o login com Google é necessário.'
-          : 'Diga diretamente que é necessário fazer login com Google.'
-      )
+      (hasAsk
+        ? 'Use ask_image para informar que o login com Google é necessário.'
+        : 'Diga diretamente que é necessário fazer login com Google.')
     );
   }
-
 
   if (state === 'authenticated_off') {
     return (
       'LEMBRETE DO MODO IMAGEM: o usuário está autenticado com Google, mas o modo Criar Imagem está DESLIGADO. ' +
       'Nunca substitua uma imagem por HTML, SVG, canvas ou código. ' +
-      (
-        hasAsk
-          ? 'Use ask_image para perguntar se pode ativar o modo imagem.'
-          : 'Informe que o modo imagem precisa ser ativado.'
-      )
+      (hasAsk
+        ? 'Use ask_image para perguntar se pode ativar o modo imagem.'
+        : 'Informe que o modo imagem precisa ser ativado.')
     );
   }
-
 
   if (state === 'authenticated_on') {
     return (
@@ -240,7 +191,6 @@ function buildImageReminder(
       'Nunca substitua a imagem por HTML/SVG/canvas/código.'
     );
   }
-
 
   return (
     'LEMBRETE DE IMAGEM: nunca substitua um pedido real de geração de imagem ' +
@@ -254,50 +204,26 @@ function buildImageReminder(
 // SYSTEM PROMPT
 // ============================================================
 
-function buildSystemPrompt(
-  lang,
-  imageContext
-) {
-  const imageState =
-    imageContext &&
-    imageContext.state
-      ? imageContext.state
-      : 'unknown';
-
+function buildSystemPrompt(lang, imageContext) {
+  const imageState = imageContext && imageContext.state ? imageContext.state : 'unknown';
 
   const imageDirective =
     imageState === 'guest'
-      ?
-
-      'Este usuário NÃO está autenticado com uma conta Google. ' +
-      'Ele NÃO pode criar imagens. Se pedir uma imagem, use ask_image ' +
-      'quando disponível para informar que o login Google é necessário. ' +
-      'NUNCA tente criar HTML, SVG, canvas, código ou qualquer representação ' +
-      'alternativa da imagem.'
-
-      :
-
-    imageState === 'authenticated_off'
-      ?
-
-      'Este usuário está autenticado com Google, mas o modo Criar Imagem está DESLIGADO. ' +
-      'Se pedir uma imagem, use ask_image quando disponível para perguntar se pode ' +
-      'ativar o modo. NUNCA tente criar HTML, SVG, canvas ou código para representar a imagem.'
-
-      :
-
-    imageState === 'authenticated_on'
-      ?
-
-      'Este usuário está autenticado com Google e o modo Criar Imagem está LIGADO. ' +
-      'Se pedir uma imagem, use imagecreator. NUNCA substitua a geração por HTML, SVG, ' +
-      'canvas ou código.'
-
-      :
-
-      'Se o usuário pedir uma imagem, use a ferramenta específica de imagem quando disponível. ' +
-      'Nunca substitua uma geração de imagem por HTML, SVG, canvas ou código.';
-
+      ? 'Este usuário NÃO está autenticado com uma conta Google. ' +
+        'Ele NÃO pode criar imagens. Se pedir uma imagem, use ask_image ' +
+        'quando disponível para informar que o login Google é necessário. ' +
+        'NUNCA tente criar HTML, SVG, canvas, código ou qualquer representação ' +
+        'alternativa da imagem.'
+      : imageState === 'authenticated_off'
+      ? 'Este usuário está autenticado com Google, mas o modo Criar Imagem está DESLIGADO. ' +
+        'Se pedir uma imagem, use ask_image quando disponível para perguntar se pode ' +
+        'ativar o modo. NUNCA tente criar HTML, SVG, canvas ou código para representar a imagem.'
+      : imageState === 'authenticated_on'
+      ? 'Este usuário está autenticado com Google e o modo Criar Imagem está LIGADO. ' +
+        'Se pedir uma imagem, use imagecreator. NUNCA substitua a geração por HTML, SVG, ' +
+        'canvas ou código.'
+      : 'Se o usuário pedir uma imagem, use a ferramenta específica de imagem quando disponível. ' +
+        'Nunca substitua uma geração de imagem por HTML, SVG, canvas ou código.';
 
   return (
   'Você é o Tato 4.1, o agente principal do app Tato IA. ' +
@@ -623,29 +549,10 @@ function buildLangReminder(lang) {
 
 function buildDateReminder(lang) {
   const now = new Date();
+  const opts = { timeZone: 'America/Sao_Paulo', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
 
   if (lang === 'en-US') {
-    const formatted =
-      now.toLocaleDateString(
-        'en-US',
-        {
-          timeZone:
-            'America/Sao_Paulo',
-
-          weekday:
-            'long',
-
-          year:
-            'numeric',
-
-          month:
-            'long',
-
-          day:
-            'numeric'
-        }
-      );
-
+    const formatted = now.toLocaleDateString('en-US', opts);
     return 'DATE REMINDER: today is ' +
       formatted +
       '. Use this as the real current date for anything time-sensitive ' +
@@ -653,29 +560,7 @@ function buildDateReminder(lang) {
       'your training data\'s sense of what year it is.';
   }
 
-
-  const formatted =
-    now.toLocaleDateString(
-      'pt-BR',
-      {
-        timeZone:
-          'America/Sao_Paulo',
-
-        weekday:
-          'long',
-
-        year:
-          'numeric',
-
-        month:
-          'long',
-
-        day:
-          'numeric'
-      }
-    );
-
-
+  const formatted = now.toLocaleDateString('pt-BR', opts);
   return 'LEMBRETE DE DATA: hoje é ' +
     formatted +
     '. Use isso como a data atual real pra qualquer coisa sensível ao ' +
@@ -688,94 +573,48 @@ function buildDateReminder(lang) {
 // TRIM
 // ============================================================
 
-function trimToSafeBoundary(
-  text
-) {
-  const windowStart =
-    Math.max(
-      0,
-      text.length - 800
-    );
+function trimToSafeBoundary(text) {
+  const windowStart = Math.max(0, text.length - 800);
+  const tail = text.slice(windowStart);
 
-  const tail =
-    text.slice(
-      windowStart
-    );
+  let idx = tail.lastIndexOf('\n\n');
+  if (idx !== -1) return text.slice(0, windowStart + idx).trimEnd();
 
-
-  let idx =
-    tail.lastIndexOf(
-      '\n\n'
-    );
-
-  if (idx !== -1) {
-    return text
-      .slice(
-        0,
-        windowStart + idx
-      )
-      .trimEnd();
-  }
-
-
-  const sentenceRe =
-    /[.!?]["'“”’)\]]?\s/g;
-
+  const sentenceRe = /[.!?]["'“”’)\]]?\s/g;
   let lastIdx = -1;
   let m;
+  while ((m = sentenceRe.exec(tail))) lastIdx = m.index + m[0].length;
+  if (lastIdx !== -1) return text.slice(0, windowStart + lastIdx).trimEnd();
 
-  while (
-    (m =
-      sentenceRe.exec(
-        tail
-      ))
-  ) {
-    lastIdx =
-      m.index +
-      m[0].length;
-  }
-
-  if (lastIdx !== -1) {
-    return text
-      .slice(
-        0,
-        windowStart +
-          lastIdx
-      )
-      .trimEnd();
-  }
-
-
-  idx =
-    tail.lastIndexOf(
-      ' '
-    );
-
-  if (idx !== -1) {
-    return text
-      .slice(
-        0,
-        windowStart + idx
-      )
-      .trimEnd();
-  }
-
+  idx = tail.lastIndexOf(' ');
+  if (idx !== -1) return text.slice(0, windowStart + idx).trimEnd();
 
   return text;
 }
 
 
 // ============================================================
-// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE)
+// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE) — Nemotron 3.5 Super VL
 // ============================================================
 
-// Step 5 Preview accepts image_url content parts using either an HTTPS URL
-// or an image data URL (Base64). Supported data URL formats: PNG, JPEG and WebP.
+// O Nemotron 3.5 Super VL aceita partes "image_url" no formato OpenAI:
+//   { type: 'image_url', image_url: { url: 'https://...' } }
+//   { type: 'image_url', image_url: { url: 'data:image/png;base64,...' } }
+// Aceitamos PNG, JPEG e WebP em data URL (Base64) ou link http(s).
+// O campo "detail" (padrão da OpenAI) NÃO é enviado: o Nemotron não usa
+// e alguns servidores recusam campos desconhecidos dentro de image_url.
 function isSupportedVisionUrl(value) {
   if (typeof value !== 'string' || !value.trim()) return false;
   const url = value.trim();
   return /^https?:\/\/\S+$/i.test(url) ||
     /^data:image\/(?:png|jpe?g|webp);base64,[a-z0-9+/=\r\n]+$/i.test(url);
+}
+
+// Remove quebras de linha do Base64 (alguns clientes mandam assim e o
+// decodificador do servidor de visão pode recusar).
+function cleanVisionUrl(url) {
+  const u = url.trim();
+  return u.startsWith('data:') ? u.replace(/[\r\n]/g, '') : u;
 }
 
 function normalizeVisionContent(content) {
@@ -784,36 +623,32 @@ function normalizeVisionContent(content) {
   }
   if (!Array.isArray(content)) return null;
 
-  const normalized = [];
+  const texts = [];
+  const images = [];
   for (const part of content) {
     if (!part || typeof part !== 'object') continue;
 
     if (part.type === 'text' && typeof part.text === 'string') {
-      if (part.text.trim()) normalized.push({ type: 'text', text: part.text });
+      if (part.text.trim()) texts.push({ type: 'text', text: part.text });
       continue;
     }
 
-    if (part.type === 'image_url') {
+    if (part.type === 'image_url' || part.type === 'image') {
       const imageUrl = typeof part.image_url === 'string'
         ? part.image_url
-        : part.image_url && part.image_url.url;
+        : (part.image_url && part.image_url.url) || part.url;
       if (!isSupportedVisionUrl(imageUrl)) continue;
-
-      const imagePart = {
-        type: 'image_url',
-        image_url: { url: imageUrl.trim() }
-      };
-      const detail = part.image_url && typeof part.image_url === 'object'
-        ? part.image_url.detail
-        : part.detail;
-      if (['auto', 'low', 'high'].includes(detail)) {
-        imagePart.image_url.detail = detail;
-      }
-      normalized.push(imagePart);
+      images.push({ type: 'image_url', image_url: { url: cleanVisionUrl(imageUrl) } });
     }
   }
 
-  return normalized.length ? normalized : null;
+  // Imagens primeiro, texto depois: é a ordem dos exemplos oficiais de
+  // modelos de visão e a que o Nemotron VL entende melhor.
+  const normalized = images.concat(texts);
+  if (!normalized.length) return null;
+  // Só texto → manda como string simples (formato mais compatível).
+  if (!images.length) return texts.map(function (t) { return t.text; }).join('\n');
+  return normalized;
 }
 
 function normalizeHistory(incoming) {
@@ -848,11 +683,7 @@ function normalizeHistory(incoming) {
     .slice(-60)
     .map(function (m) {
       if (m.role === 'tool') {
-        return {
-          role: 'tool',
-          tool_call_id: m.tool_call_id,
-          content: m.content
-        };
+        return { role: 'tool', tool_call_id: m.tool_call_id, content: m.content };
       }
 
       if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
@@ -860,17 +691,12 @@ function normalizeHistory(incoming) {
           role: 'assistant',
           content: typeof m.content === 'string' ? (m.content || null) : null,
           tool_calls: m.tool_calls,
-          ...(typeof m.reasoning_content === 'string'
-            ? { reasoning_content: m.reasoning_content }
-            : {})
+          ...(typeof m.reasoning_content === 'string' ? { reasoning_content: m.reasoning_content } : {})
         };
       }
 
       if (m.role === 'user') {
-        return {
-          role: 'user',
-          content: normalizeVisionContent(m.content)
-        };
+        return { role: 'user', content: normalizeVisionContent(m.content) };
       }
 
       return {
@@ -891,10 +717,7 @@ function attachSeparateImages(history, rawImages) {
 
   let userIndex = -1;
   for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i] && history[i].role === 'user') {
-      userIndex = i;
-      break;
-    }
+    if (history[i] && history[i].role === 'user') { userIndex = i; break; }
   }
   if (userIndex < 0) return history;
 
@@ -912,25 +735,21 @@ function attachSeparateImages(history, rawImages) {
           (typeof entry.image_url === 'string' ? entry.image_url : entry.image_url && entry.image_url.url)
         );
     if (isSupportedVisionUrl(candidate)) {
-      imageParts.push({ type: 'image_url', image_url: { url: candidate.trim() } });
+      imageParts.push({ type: 'image_url', image_url: { url: cleanVisionUrl(candidate) } });
     }
   }
   if (!imageParts.length) return history;
 
-  const parts = Array.isArray(current)
-    ? current.slice()
-    : (typeof current === 'string' && current.trim()
-        ? [{ type: 'text', text: current }]
-        : []);
-  history[userIndex] = {
-    ...history[userIndex],
-    content: parts.concat(imageParts)
-  };
+  const textParts = Array.isArray(current)
+    ? current.filter(part => part && part.type === 'text')
+    : (typeof current === 'string' && current.trim() ? [{ type: 'text', text: current }] : []);
+  history[userIndex] = { ...history[userIndex], content: imageParts.concat(textParts) };
   return history;
 }
 
-// NVIDIA documents a maximum of eight images per request. Keep the newest
-// eight if a long conversation accumulated older image attachments.
+// O Nemotron 3.5 Super VL aceita no máximo 4 imagens por requisição.
+// Mantém as mais RECENTES e troca as antigas por um aviso em texto, pra
+// conversa continuar fazendo sentido.
 function limitHistoryImages(history) {
   let total = 0;
   for (const message of history) {
@@ -938,23 +757,70 @@ function limitHistoryImages(history) {
       total += message.content.filter(part => part && part.type === 'image_url').length;
     }
   }
-  let toRemove = Math.max(0, total - 8);
+  let toRemove = Math.max(0, total - MAX_IMAGES_PER_REQUEST);
   if (!toRemove) return history;
 
   for (const message of history) {
     if (toRemove <= 0) break;
     if (!message || !Array.isArray(message.content)) continue;
     const next = [];
+    let removedHere = 0;
     for (const part of message.content) {
       if (toRemove > 0 && part && part.type === 'image_url') {
         toRemove--;
+        removedHere++;
         continue;
       }
       next.push(part);
     }
-    message.content = next;
+    if (removedHere) {
+      next.push({ type: 'text', text: '[' + removedHere + ' imagem(ns) antiga(s) desta mensagem foram omitidas por limite de imagens]' });
+    }
+    message.content = next.some(p => p.type === 'image_url')
+      ? next
+      : next.map(p => p.text).filter(Boolean).join('\n');
   }
   return history;
+}
+
+
+// ============================================================
+// MONTAGEM DAS MENSAGENS PRO NEMOTRON
+// ============================================================
+
+// O chat template do Nemotron (mesma família do Qwen3) só aceita mensagem
+// "system" NO INÍCIO da conversa. Mandar system no meio ou no fim pode
+// dar erro 400 ou fazer o modelo ignorar. Por isso:
+//  - todos os system (prompt principal + system que vierem no histórico)
+//    viram UM único system no topo;
+//  - os lembretes finais (arquivos, data, idioma, imagem, raciocínio,
+//    GitHub) entram no fim da ÚLTIMA mensagem do usuário, pra continuarem
+//    "perto" da decisão do modelo; se a conversa terminar em resultado de
+//    ferramenta, eles vão no system do topo.
+function buildMessages(systemText, history, reminders) {
+  const extraSystem = [];
+  const rest = [];
+  for (const m of history) {
+    if (m.role === 'system') extraSystem.push(m.content);
+    else rest.push(m);
+  }
+
+  const reminderText = reminders.filter(Boolean).join('\n\n');
+  const last = rest[rest.length - 1];
+  let systemContent = [systemText].concat(extraSystem).join('\n\n');
+
+  if (last && last.role === 'user' && reminderText) {
+    const tag = '\n\n<lembretes_do_sistema>\n' + reminderText + '\n</lembretes_do_sistema>';
+    if (typeof last.content === 'string') {
+      rest[rest.length - 1] = { ...last, content: last.content + tag };
+    } else if (Array.isArray(last.content)) {
+      rest[rest.length - 1] = { ...last, content: last.content.concat([{ type: 'text', text: tag.trim() }]) };
+    }
+  } else if (reminderText) {
+    systemContent += '\n\n' + reminderText;
+  }
+
+  return [{ role: 'system', content: systemContent }].concat(rest);
 }
 
 
@@ -966,8 +832,11 @@ function getLatestUserMessage(history) {
   if (!Array.isArray(history)) return '';
   for (let i = history.length - 1; i >= 0; i--) {
     const message = history[i];
-    if (message && message.role === 'user' && typeof message.content === 'string') {
-      return message.content.trim();
+    if (message && message.role === 'user') {
+      if (typeof message.content === 'string') return message.content.trim();
+      if (Array.isArray(message.content)) {
+        return message.content.filter(p => p && p.type === 'text').map(p => p.text).join('\n').trim();
+      }
     }
   }
   return '';
@@ -997,160 +866,63 @@ function isExplicitGithubRequest(history) {
 // THINK FILTER
 // ============================================================
 
+// O Nemotron pode devolver o raciocínio em reasoning_content/reasoning
+// (separado) ou embutido no content entre <think>...</think>. Este filtro
+// cobre o segundo caso.
 function makeThinkFilter() {
   let buffer = '';
   let inThink = false;
 
-
-  function feed(
-    chunk
-  ) {
-    buffer +=
-      chunk;
-
+  function feed(chunk) {
+    buffer += chunk;
     let visible = '';
     let thinking = '';
 
-
     while (true) {
-
       if (!inThink) {
-
-        const i =
-          buffer.indexOf(
-            '<think>'
-          );
-
+        const i = buffer.indexOf('<think>');
         if (i !== -1) {
-          visible +=
-            buffer.slice(
-              0,
-              i
-            );
-
-          buffer =
-            buffer.slice(
-              i + 7
-            );
-
-          inThink =
-            true;
-
+          visible += buffer.slice(0, i);
+          buffer = buffer.slice(i + 7);
+          inThink = true;
           continue;
         }
-
-
-        const holdBack =
-          Math.min(
-            6,
-            buffer.length
-          );
-
-        visible +=
-          buffer.slice(
-            0,
-            buffer.length -
-              holdBack
-          );
-
-        buffer =
-          buffer.slice(
-            buffer.length -
-              holdBack
-          );
-
+        const holdBack = Math.min(6, buffer.length);
+        visible += buffer.slice(0, buffer.length - holdBack);
+        buffer = buffer.slice(buffer.length - holdBack);
         break;
-
       } else {
-
-        const j =
-          buffer.indexOf(
-            '</think>'
-          );
-
+        const j = buffer.indexOf('</think>');
         if (j !== -1) {
-          thinking +=
-            buffer.slice(
-              0,
-              j
-            );
-
-          buffer =
-            buffer.slice(
-              j + 8
-            );
-
-          inThink =
-            false;
-
+          thinking += buffer.slice(0, j);
+          buffer = buffer.slice(j + 8);
+          inThink = false;
           continue;
         }
-
-
-        const holdBack =
-          Math.min(
-            7,
-            buffer.length
-          );
-
-        thinking +=
-          buffer.slice(
-            0,
-            buffer.length -
-              holdBack
-          );
-
-        buffer =
-          buffer.slice(
-            buffer.length -
-              holdBack
-          );
-
+        const holdBack = Math.min(7, buffer.length);
+        thinking += buffer.slice(0, buffer.length - holdBack);
+        buffer = buffer.slice(buffer.length - holdBack);
         break;
       }
     }
 
-
-    return {
-      visible:
-        visible,
-
-      thinking:
-        thinking
-    };
+    return { visible: visible, thinking: thinking };
   }
-
 
   function flushRemainder() {
-    const leftover =
-      buffer;
-
+    const leftover = buffer;
+    const wasThinking = inThink;
     buffer = '';
-    inThink =
-      false;
-
-    return {
-      visible:
-        leftover,
-
-      thinking:
-        ''
-    };
+    inThink = false;
+    return wasThinking ? { visible: '', thinking: leftover } : { visible: leftover, thinking: '' };
   }
 
-
-  return {
-    feed:
-      feed,
-
-    flushRemainder:
-      flushRemainder
-  };
+  return { feed: feed, flushRemainder: flushRemainder };
 }
 
 
 // ============================================================
-// CONTROLE DE RACIOCÍNIO (adaptativo + orçamento)
+// CONTROLE DE RACIOCÍNIO (adaptativo + orçamento) — esforço ALTO
 // ============================================================
 
 function normalizeText(s) {
@@ -1176,18 +948,32 @@ function lastMessageInfo(history) {
   return { text: text, hasImage: hasImage, lastRole: last ? last.role : '' };
 }
 
-const COMPLEX_RE = /(refator|arquitet|debug|depur|otimiz|algoritm|migra[cr]|seguranc|desempenho|banco de dados|sistema completo|do zero|passo a passo|demonstr|prove|equacao|integral|derivada)/;
-const WORK_RE = /(codigo|code|bug|erro|error|arquivo|file|html|css|script|funcao|function|implement|corrig|conserta|ajust|crie|criar|gere|gerar|jogo|app\b|site|projeto|sistema|calcul|analis|compar|explique|explica)/;
+const COMPLEX_RE = /(refator|arquitet|debug|depur|otimiz|algoritm|migra[cr]|seguranc|desempenho|banco de dados|sistema completo|do zero|passo a passo|demonstr|prove|equacao|integral|derivada|complex|dificil|logica|escalavel|concorren)/;
+const WORK_RE = /(codigo|code|bug|erro|error|arquivo|file|html|css|script|funcao|function|implement|corrig|conserta|ajust|crie|criar|gere|gerar|jogo|app\b|site|projeto|sistema|calcul|analis|compar|explique|explica|resolv|por que|porque|como funciona)/;
+// Mensagens curtinhas de conversa: nunca ativam raciocínio.
+const SMALLTALK_RE = /^(oi+|ola|opa|eai|e ai|salve|bom dia|boa tarde|boa noite|tudo bem|td bem|beleza|blz|valeu|vlw|obrigad[oa]|brigad[oa]|ok|okay|certo|show|top|kkk+|haha+|hello|hi|hey|thanks|thank you|tchau)[\s!?.,]*$/;
 
+// Decide se o Nemotron pensa nesta resposta e com qual orçamento (em TOKENS):
+//   simples/conversa → desligado | normal → 8K | complexo → 50K
 function decideThinking(history) {
-  if (THINKING_MODE === 'off') return { enabled: false, budget: 0, level: 'off' };
-  if (THINKING_MODE === 'on') return { enabled: true, budget: Infinity, level: 'on' };
+  if (THINKING_MODE === 'off') return { enabled: false, budgetTokens: 0, level: 'off' };
+  if (THINKING_MODE === 'on') return { enabled: true, budgetTokens: THINK_BUDGET_COMPLEX_TOKENS, level: 'on' };
   const info = lastMessageInfo(history);
-  const t = normalizeText(info.text);
-  if (info.lastRole === 'tool') return { enabled: true, budget: THINK_BUDGET_NORMAL, level: 'normal' };
-  if (COMPLEX_RE.test(t) || t.length > 1500) return { enabled: true, budget: THINK_BUDGET_COMPLEX, level: 'complex' };
-  if (info.hasImage || WORK_RE.test(t) || t.length > 240) return { enabled: true, budget: THINK_BUDGET_NORMAL, level: 'normal' };
-  return { enabled: false, budget: 0, level: 'simple' };
+  const t = normalizeText(info.text).trim();
+  if (info.lastRole === 'tool') return { enabled: true, budgetTokens: THINK_BUDGET_NORMAL_TOKENS, level: 'normal' };
+  if (!info.hasImage && (SMALLTALK_RE.test(t) || (t.length < 25 && !WORK_RE.test(t)))) {
+    return { enabled: false, budgetTokens: 0, level: 'simple' };
+  }
+  if (COMPLEX_RE.test(t) || t.length > 1500) return { enabled: true, budgetTokens: THINK_BUDGET_COMPLEX_TOKENS, level: 'complex' };
+  if (info.hasImage || WORK_RE.test(t) || t.length > 240) return { enabled: true, budgetTokens: THINK_BUDGET_NORMAL_TOKENS, level: 'normal' };
+  return { enabled: false, budgetTokens: 0, level: 'simple' };
+}
+
+// Esforço ALTO do Nemotron 3.5: enable_thinking true + medium_effort false.
+function thinkingKwargs(enabled) {
+  return enabled
+    ? { enable_thinking: true, medium_effort: false }
+    : { enable_thinking: false };
 }
 
 function buildThinkingReminder(lang) {
@@ -1208,1410 +994,567 @@ function buildThinkingReminder(lang) {
 // EXPRESS
 // ============================================================
 
-const app =
-  express();
+const app = express();
 
-app.use(
-  express.json({
-    limit:
-      '35mb'
-  })
-);
+app.use(express.json({ limit: '35mb' }));
 
-
-app.use(
-  function (
-    req,
-    res,
-    next
-  ) {
-    res.setHeader(
-      'Access-Control-Allow-Origin',
-      '*'
-    );
-
-    res.setHeader(
-      'Access-Control-Allow-Methods',
-      'POST, OPTIONS'
-    );
-
-    res.setHeader(
-      'Access-Control-Allow-Headers',
-      'Content-Type, Authorization'
-    );
-
-    if (
-      req.method ===
-      'OPTIONS'
-    ) {
-      return res
-        .status(204)
-        .end();
-    }
-
-    next();
-  }
-);
+app.use(function (req, res, next) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
 
 
 // ============================================================
 // HEALTH
 // ============================================================
 
-app.get(
-  '/health',
-  function (
-    req,
-    res
-  ) {
-    res
-      .status(200)
-      .send('ok');
-  }
-);
+app.get('/health', function (req, res) {
+  res.status(200).send('ok');
+});
 
 
 // ============================================================
 // CHAT
 // ============================================================
 
-app.post(
-  '/',
-  async function (
-    req,
-    res
-  ) {
+app.post('/', async function (req, res) {
 
-    const NVIDIA_API_KEY =
-      process.env.NVIDIA_API_KEY;
+  const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
+
+  if (!NVIDIA_API_KEY) {
+    return res.status(500).json({ ok: false, error: 'NVIDIA_API_KEY não configurada nas variáveis de ambiente.' });
+  }
+
+  const body = req.body;
+
+  const history = limitHistoryImages(
+    attachSeparateImages(normalizeHistory(body && body.messages), body && body.images)
+  );
+
+  if (!history.length) {
+    return res.status(400).json({ ok: false, error: 'Nenhuma mensagem enviada.' });
+  }
+
+  const tools = Array.isArray(body && body.tools) ? body.tools : undefined;
+
+  const hasGithubTool = Array.isArray(tools) && tools.some(function (tool) {
+    return tool && tool.function && tool.function.name === 'github';
+  });
+
+  const explicitGithubRequest = isExplicitGithubRequest(history);
+
+  if (explicitGithubRequest) {
+    console.log('Pedido explícito de GitHub detectado — ferramenta:', hasGithubTool ? 'FORÇADA' : 'INDISPONÍVEL NO REQUEST');
+  }
+
+  const lang = body && body.lang === 'en-US' ? 'en-US' : 'pt-BR';
+
+  // Este worker é o backend do Tato 4.1.
+  const modelMode = 'tato-4.1';
+  const thinkDecision = decideThinking(history);
+  const reasoningEnabled = thinkDecision.enabled;
+  const thinkBudgetTokens = thinkDecision.enabled ? thinkDecision.budgetTokens : 0;
+  let thinkingCutDone = false;
+  console.log('[Tato 4.1] raciocínio:', thinkDecision.level, '| esforço:', reasoningEnabled ? 'alto' : 'desligado', '| orçamento:', thinkBudgetTokens, 'tokens');
+
+  const imageContext = normalizeImageContext(body, tools);
+
+  const reminders = [
+    FILE_REMINDER,
+    buildDateReminder(lang),
+    buildLangReminder(lang),
+    buildImageReminder(lang, imageContext, tools),
+    buildThinkingReminder(lang),
+    explicitGithubRequest && hasGithubTool
+      ? 'GITHUB TOOL OVERRIDE: o pedido atual do usuário menciona explicitamente GitHub. ' +
+        'É OBRIGATÓRIO chamar a ferramenta github nesta resposta antes de responder. ' +
+        'Não responda apenas de memória e não substitua a chamada por web_search. ' +
+        'Use a operação do GitHub mais adequada ao pedido atual. ' +
+        'Depois de receber o resultado da ferramenta, responda normalmente.'
+      : ''
+  ];
+
+  const payload = {
+    model: MODEL,
+    messages: buildMessages(buildSystemPrompt(lang, imageContext), history, reminders),
+    // Limite máximo de saída: 320K tokens (com fallback automático se o
+    // endpoint recusar). O corpo JSON aceita até 35 MB para mensagens
+    // multimodais com imagens Base64 e histórico textual.
+    max_tokens: MAX_TOKENS_STANDARD,
+    temperature: TEMPERATURE,
+    top_p: TOP_P,
+    // Esforço ALTO quando ligado: enable_thinking true + medium_effort false.
+    chat_template_kwargs: thinkingKwargs(reasoningEnabled),
+    stream: true
+  };
+
+  if (tools && tools.length) {
+    payload.tools = tools;
+    // Em pedido explícito de GitHub, a API é instruída a chamar a função
+    // diretamente. Isso evita depender apenas da decisão do modelo.
+    payload.tool_choice = explicitGithubRequest && hasGithubTool
+      ? { type: 'function', function: { name: 'github' } }
+      : 'auto';
+  }
 
 
-    if (!NVIDIA_API_KEY) {
-      return res
-        .status(500)
-        .json({
-          ok:
-            false,
+  // ==========================================================
+  // RETRIES (nível transporte: 429/502/503 vindos da NVIDIA antes
+  // mesmo de começar a receber qualquer byte do stream)
+  // ==========================================================
 
-          error:
-            'NVIDIA_API_KEY não configurada nas variáveis de ambiente.'
+  const MAX_RETRIES = 3;
+  const RETRYABLE_STATUS = new Set([429, 502, 503]);
+
+  function sleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  // Se a NVIDIA recusar o max_tokens (400 falando de max_tokens/contexto),
+  // reduz pro próximo degrau de MAX_TOKENS_FALLBACK e tenta de novo.
+  function maybeLowerMaxTokens(status, text) {
+    if (status !== 400 && status !== 422) return false;
+    if (!/max_tokens|max_completion|maximum|context|too large|exceed/i.test(text || '')) return false;
+    const next = MAX_TOKENS_FALLBACK.find(function (v) { return v < payload.max_tokens; });
+    if (!next) return false;
+    console.warn('[Tato 4.1] max_tokens', payload.max_tokens, 'recusado pela NVIDIA — tentando com', next);
+    payload.max_tokens = next;
+    return true;
+  }
+
+  // Extraído pra função porque pode ser chamado mais de uma vez:
+  // uma vez antes de abrir o SSE pro cliente, e de novo (silenciosamente)
+  // se uma tentativa terminar em "resposta vazia" ou estourar o orçamento
+  // de raciocínio.
+  async function requestUpstreamWithRetry() {
+    let upstream;
+    let lastErrStatus = null;
+    let lastErrText = '';
+
+    try {
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        upstream = await fetch(NVIDIA_ENDPOINT, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + NVIDIA_API_KEY,
+            'Accept': 'text/event-stream'
+          },
+          body: JSON.stringify(payload)
         });
-    }
 
+        if (upstream.ok && upstream.body) return { upstream };
 
-    const body =
-      req.body;
+        lastErrStatus = upstream.status;
+        const isRetryable = RETRYABLE_STATUS.has(upstream.status);
+        const isLastAttempt = attempt === MAX_RETRIES;
 
-
-    const history = limitHistoryImages(
-      attachSeparateImages(
-        normalizeHistory(body && body.messages),
-        body && body.images
-      )
-    );
-
-
-    if (!history.length) {
-      return res
-        .status(400)
-        .json({
-          ok:
-            false,
-
-          error:
-            'Nenhuma mensagem enviada.'
-        });
-    }
-
-
-    const tools =
-      Array.isArray(
-        body &&
-          body.tools
-      )
-        ? body.tools
-        : undefined;
-
-
-    const hasGithubTool =
-      Array.isArray(tools) &&
-      tools.some(function (tool) {
-        return tool && tool.function && tool.function.name === 'github';
-      });
-
-    const explicitGithubRequest =
-      isExplicitGithubRequest(history);
-
-    if (explicitGithubRequest) {
-      console.log(
-        'Pedido explícito de GitHub detectado — ferramenta:',
-        hasGithubTool ? 'FORÇADA' : 'INDISPONÍVEL NO REQUEST'
-      );
-    }
-
-    const lang =
-      (
-        body &&
-        body.lang ===
-          'en-US'
-      )
-        ? 'en-US'
-        : 'pt-BR';
-
-    // Este worker é o backend do Tato 4.1.
-    const modelMode = 'tato-4.1';
-    const requestMaxTokens = MAX_TOKENS_STANDARD;
-    const thinkDecision = decideThinking(history);
-    const reasoningEnabled = thinkDecision.enabled;
-    let thinkingCutDone = false;
-    console.log('[Tato 4.1] raciocínio:', thinkDecision.level, '| orçamento:', thinkDecision.budget);
-
-
-    const imageContext =
-      normalizeImageContext(
-        body,
-        tools
-      );
-
-
-    const payload = {
-      model:
-        MODEL,
-
-      messages:
-        [
-          {
-            role:
-              'system',
-
-            content:
-              buildSystemPrompt(
-                lang,
-                imageContext
-              )
-          }
-        ]
-        .concat(
-          history
-        )
-        .concat(
-          [
-            {
-              role:
-                'system',
-
-              content:
-                FILE_REMINDER
-            },
-
-            {
-              role:
-                'system',
-
-              content:
-                buildDateReminder(
-                  lang
-                )
-            },
-
-            {
-              role:
-                'system',
-
-              content:
-                buildLangReminder(
-                  lang
-                )
-            },
-
-            {
-              role:
-                'system',
-
-              content:
-                buildImageReminder(
-                  lang,
-                  imageContext,
-                  tools
-                )
-            },
-
-            {
-              role: 'system',
-              content: buildThinkingReminder(lang)
-            },
-
-            ...(explicitGithubRequest && hasGithubTool
-              ? [{
-                  role: 'system',
-                  content:
-                    'GITHUB TOOL OVERRIDE: o pedido atual do usuário menciona explicitamente GitHub. ' +
-                    'É OBRIGATÓRIO chamar a ferramenta github nesta resposta antes de responder. ' +
-                    'Não responda apenas de memória e não substitua a chamada por web_search. ' +
-                    'Use a operação do GitHub mais adequada ao pedido atual. ' +
-                    'Depois de receber o resultado da ferramenta, responda normalmente.'
-                }]
-              : [])
-          ]
-        ),
-
-      // Limite máximo de saída: 256K tokens. O corpo JSON aceita até 35 MB
-      // para mensagens multimodais com imagens Base64 e histórico textual.
-      max_tokens:
-        requestMaxTokens,
-
-      temperature: 0.2,
-
-      // Reasoning somente por ligado/desligado.
-      // Neste backend ele fica permanentemente ligado.
-      chat_template_kwargs: {
-        enable_thinking:
-          reasoningEnabled,
-        preserve_thinking:
-          true
-      },
-
-      stream:
-        true
-    };
-
-
-    if (
-      tools &&
-      tools.length
-    ) {
-      payload.tools =
-        tools;
-
-      // Em pedido explícito de GitHub, a API é instruída a chamar a função
-      // diretamente. Isso evita depender apenas da decisão do modelo.
-      if (explicitGithubRequest && hasGithubTool) {
-        payload.tool_choice = {
-          type: 'function',
-          function: {
-            name: 'github'
-          }
-        };
-      } else {
-        payload.tool_choice =
-          'auto';
-      }
-    }
-
-
-    // ==========================================================
-    // RETRIES (nível transporte: 429/502/503 vindos da NVIDIA antes
-    // mesmo de começar a receber qualquer byte do stream)
-    // ==========================================================
-
-    const MAX_RETRIES =
-      3;
-
-    const RETRYABLE_STATUS =
-      new Set([
-        429,
-        502,
-        503
-      ]);
-
-
-    function sleep(
-      ms
-    ) {
-      return new Promise(
-        function (
-          resolve
-        ) {
-          setTimeout(
-            resolve,
-            ms
-          );
+        if (!isRetryable) {
+          lastErrText = await upstream.text().catch(function () { return ''; });
+          if (maybeLowerMaxTokens(upstream.status, lastErrText)) { attempt--; continue; }
+          break;
         }
-      );
-    }
-
-    // Extraído pra função porque agora pode ser chamado mais de uma vez:
-    // uma vez antes de abrir o SSE pro cliente, e de novo (silenciosamente)
-    // se uma tentativa terminar em "resposta vazia" (ver MAX_EMPTY_RETRIES
-    // mais abaixo). Retorna o Response da NVIDIA em caso de sucesso, ou
-    // null depois de já ter respondido `res` com um erro 502 (só é seguro
-    // fazer isso ANTES de res.writeHead ter sido chamado pro SSE).
-    async function requestUpstreamWithRetry() {
-      let upstream;
-      let lastErrStatus = null;
-      let lastErrText = '';
-
-      try {
-
-        for (
-          let attempt = 0;
-          attempt <=
-            MAX_RETRIES;
-          attempt++
-        ) {
-
-          upstream =
-            await fetch(
-              NVIDIA_ENDPOINT,
-              {
-                method:
-                  'POST',
-
-                headers: {
-                  'Content-Type':
-                    'application/json',
-
-                  'Authorization':
-                    'Bearer ' +
-                    NVIDIA_API_KEY,
-
-                  'Accept':
-                    'text/event-stream'
-                },
-
-                body:
-                  JSON.stringify(
-                    payload
-                  )
-              }
-            );
-
-
-          if (
-            upstream.ok &&
-            upstream.body
-          ) {
-            return { upstream };
-          }
-
-
-          lastErrStatus =
-            upstream.status;
-
-
-          const isRetryable =
-            RETRYABLE_STATUS.has(
-              upstream.status
-            );
-
-
-          const isLastAttempt =
-            attempt ===
-            MAX_RETRIES;
-
-
-          if (
-            !isRetryable ||
-            isLastAttempt
-          ) {
-            lastErrText =
-              await upstream
-                .text()
-                .catch(
-                  function () {
-                    return '';
-                  }
-                );
-
-            break;
-          }
-
-
-          await upstream
-            .text()
-            .catch(
-              function () {
-                return '';
-              }
-            );
-
-
-          const retryAfterHeader =
-            upstream.headers.get(
-              'retry-after'
-            );
-
-
-          const retryAfterMs =
-            retryAfterHeader
-              ? (
-                  parseFloat(
-                    retryAfterHeader
-                  ) *
-                  1000
-                )
-              : null;
-
-
-          const backoffMs =
-            retryAfterMs &&
-            !isNaN(
-              retryAfterMs
-            )
-              ? retryAfterMs
-              : (
-                  1000 *
-                  Math.pow(
-                    2,
-                    attempt
-                  )
-                ) +
-                Math.floor(
-                  Math.random() *
-                    300
-                );
-
-
-          await sleep(
-            backoffMs
-          );
+        if (isLastAttempt) {
+          lastErrText = await upstream.text().catch(function () { return ''; });
+          break;
         }
 
-      } catch (
-        err
-      ) {
+        await upstream.text().catch(function () { return ''; });
 
-        return { fatal: true };
+        const retryAfterHeader = upstream.headers.get('retry-after');
+        const retryAfterMs = retryAfterHeader ? parseFloat(retryAfterHeader) * 1000 : null;
+        const backoffMs = retryAfterMs && !isNaN(retryAfterMs)
+          ? retryAfterMs
+          : (1000 * Math.pow(2, attempt)) + Math.floor(Math.random() * 300);
+
+        await sleep(backoffMs);
       }
-
-      console.error(
-        'Erro upstream da IA após retries — status:',
-        lastErrStatus,
-        'body:',
-        (
-          lastErrText ||
-          ''
-        ).slice(
-          0,
-          300
-        )
-      );
-
+    } catch (err) {
+      console.error('Erro de rede falando com a NVIDIA:', err && err.message || err);
       return { fatal: true };
     }
 
-    let upstream;
-    {
-      const first = await requestUpstreamWithRetry();
-      if (first.fatal || !first.upstream) {
-        return res
-          .status(502)
-          .json({
-            ok:
-              false,
+    console.error('Erro upstream da IA após retries — status:', lastErrStatus, 'body:', (lastErrText || '').slice(0, 300));
+    return { fatal: true, status: lastErrStatus, text: lastErrText };
+  }
 
-            error:
-              'Server sobrecarregado, tente novamente mais tarde.'
-          });
-      }
-      upstream = first.upstream;
+  let upstream;
+  {
+    const first = await requestUpstreamWithRetry();
+    if (first.fatal || !first.upstream) {
+      return res.status(502).json({ ok: false, error: 'Server sobrecarregado, tente novamente mais tarde.' });
+    }
+    upstream = first.upstream;
+  }
+
+
+  // ==========================================================
+  // SSE
+  // ==========================================================
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+
+  let closed = false;
+  let reader = null;
+
+  function send(obj) {
+    if (closed) return;
+    try { res.write('data: ' + JSON.stringify(obj) + '\n\n'); } catch (e) { /* conexão já fechou */ }
+  }
+
+  function ping() {
+    if (closed) return;
+    try { res.write(': ping\n\n'); } catch (e) { /* conexão já fechou */ }
+  }
+
+  function finish() {
+    if (closed) return;
+    closed = true;
+    clearInterval(heartbeatId);
+    clearTimeout(timeoutId);
+    try { res.end(); } catch (e) { /* já fechado */ }
+  }
+
+  req.on('close', function () {
+    closed = true;
+    if (reader) { try { reader.cancel(); } catch (e) { /* ignora */ } }
+  });
+
+  const heartbeatId = setInterval(ping, HEARTBEAT_MS);
+
+  const timeoutId = setTimeout(function () {
+    if (reader) { try { reader.cancel(); } catch (e) { /* ignora */ } }
+  }, FETCH_TIMEOUT_MS);
+
+
+  // ==========================================================
+  // LOOP DE TENTATIVAS "SILENCIOSAS" PARA RESPOSTA VAZIA
+  // ==========================================================
+  //
+  // O modelo pode ocasionalmente terminar um turno sem produzir NENHUM texto
+  // visível (finish_reason "stop", mas content vazio e nenhum tool_call
+  // novo) — tudo que ele gerou ficou só como reasoning/<think>. Para evitar
+  // mostrar diretamente o erro "A IA não retornou uma resposta.", tentamos
+  // novamente em silêncio antes de desistir.
+  const MAX_EMPTY_RETRIES = 2;
+
+  for (let emptyAttempt = 0; ; emptyAttempt++) {
+
+    let budgetCut = false;
+    const think = makeThinkFilter();
+    const toolCallsAcc = [];
+    let contentAcc = '';
+    let finishReason = null;
+    let sawAnyChunk = false;
+    let pendingDelta = '';
+    let pendingThinking = '';
+    // Mantemos reasoning_content completo pras próximas rodadas quando tools estão ativas.
+    let reasoningContentAcc = '';
+    let flushTimer = null;
+
+    // Orçamento de raciocínio em tokens (≈ caracteres / 4). Só corta se o
+    // modelo ainda não começou a responder nem chamou ferramenta.
+    function overBudget() {
+      return reasoningEnabled &&
+        !thinkingCutDone &&
+        !contentAcc &&
+        !toolCallsAcc.length &&
+        Math.ceil(reasoningContentAcc.length / CHARS_PER_TOKEN) > thinkBudgetTokens;
     }
 
-
-    // ==========================================================
-    // SSE
-    // ==========================================================
-
-    res.writeHead(
-      200,
-      {
-        'Content-Type':
-          'text/event-stream; charset=utf-8',
-
-        'Cache-Control':
-          'no-cache, no-transform',
-
-        'Connection':
-          'keep-alive',
-
-        'X-Accel-Buffering':
-          'no'
-      }
-    );
-
-
-    let closed =
-      false;
-
-
-    let reader =
-      null;
-
-
-    function send(
-      obj
-    ) {
-      if (closed) {
-        return;
-      }
-
-      try {
-        res.write(
-          'data: ' +
-          JSON.stringify(
-            obj
-          ) +
-          '\n\n'
-        );
-      } catch (e) {
-        // conexão já fechou
-      }
+    function flushPending() {
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      if (pendingThinking) { send({ type: 'thinking', text: pendingThinking }); pendingThinking = ''; }
+      if (pendingDelta) { send({ type: 'delta', text: pendingDelta }); pendingDelta = ''; }
     }
 
-
-    function ping() {
-      if (closed) {
-        return;
-      }
-
-      try {
-        res.write(
-          ': ping\n\n'
-        );
-      } catch (e) {
-        // conexão já fechou
-      }
+    function scheduleFlush() {
+      if (flushTimer || closed) return;
+      flushTimer = setTimeout(flushPending, FLUSH_MS);
     }
 
+    reader = upstream.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuffer = '';
 
-    function finish() {
+    try {
+      outer:
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      if (closed) {
-        return;
-      }
+        sawAnyChunk = true;
+        sseBuffer += decoder.decode(value, { stream: true });
+        // SSE pode chegar com LF ou CRLF.
+        sseBuffer = sseBuffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
+        let idx;
+        while ((idx = sseBuffer.indexOf('\n\n')) !== -1) {
+          const rawEvent = sseBuffer.slice(0, idx);
+          sseBuffer = sseBuffer.slice(idx + 2);
 
-      closed =
-        true;
+          const line = rawEvent.split('\n').find(function (l) { return l.indexOf('data:') === 0; });
+          if (!line) continue;
 
+          const dataStr = line.slice(5).trim();
+          if (!dataStr || dataStr === '[DONE]') continue;
 
-      clearInterval(
-        heartbeatId
-      );
+          let evt;
+          try { evt = JSON.parse(dataStr); } catch (e) { continue; }
 
+          const choice = evt.choices && evt.choices[0];
+          if (!choice) continue;
 
-      clearTimeout(
-        timeoutId
-      );
+          const delta = choice.delta || {};
 
-
-      try {
-        res.end();
-      } catch (e) {
-        // já fechado
-      }
-    }
-
-
-    req.on(
-      'close',
-      function () {
-        closed =
-          true;
-
-        if (reader) {
-          try {
-            reader.cancel();
-          } catch (e) {
-            // ignora
-          }
-        }
-      }
-    );
-
-
-    const heartbeatId =
-      setInterval(
-        ping,
-        HEARTBEAT_MS
-      );
-
-
-    const timeoutId =
-      setTimeout(
-        function () {
-          if (reader) {
-            try {
-              reader.cancel();
-            } catch (e) {
-              // ignora
-            }
-          }
-        },
-        FETCH_TIMEOUT_MS
-      );
-
-
-    // ==========================================================
-    // LOOP DE TENTATIVAS "SILENCIOSAS" PARA RESPOSTA VAZIA
-    // ==========================================================
-    //
-    // O modelo pode ocasionalmente terminar um turno sem produzir NENHUM texto
-    // visível (finish_reason "stop", mas content vazio e nenhum tool_call
-    // novo) — tudo que ele gerou ficou só como reasoning/<think>. Para evitar
-    // mostrar diretamente o erro "A IA não retornou uma resposta.", tentamos
-    // novamente em silêncio antes de desistir. O streaming de texto real
-    // continua acontecendo ao vivo normalmente; só quando uma tentativa
-    // termina vazia é que fazemos uma nova chamada por trás dos panos.
-    const MAX_EMPTY_RETRIES = 2;
-
-    for (let emptyAttempt = 0; ; emptyAttempt++) {
-
-      let budgetCut = false;
-
-      const think =
-        makeThinkFilter();
-
-      let estimatedThinkingTokens = 0;
-
-      function registerThinking(text) {
-        if (!text) return;
-        estimatedThinkingTokens += Math.ceil(String(text).length / 4);
-      }
-
-
-      const toolCallsAcc =
-        [];
-
-
-      let contentAcc =
-        '';
-
-
-      let finishReason =
-        null;
-
-
-      let sawAnyChunk =
-        false;
-
-
-      let pendingDelta =
-        '';
-
-
-      let pendingThinking =
-        '';
-
-      // Mantemos reasoning_content completo pras próximas rodadas quando tools estão ativas.
-      let reasoningContentAcc =
-        '';
-
-
-      let flushTimer =
-        null;
-
-
-      function flushPending() {
-
-        if (
-          flushTimer
-        ) {
-          clearTimeout(
-            flushTimer
-          );
-
-          flushTimer =
-            null;
-        }
-
-
-        if (
-          pendingThinking
-        ) {
-          send({
-            type:
-              'thinking',
-
-            text:
-              pendingThinking
-          });
-
-          pendingThinking =
+          // O Nemotron (via NVIDIA/vLLM) manda o raciocínio em
+          // reasoning_content ou reasoning; aceitamos as variantes.
+          const reasoningPiece =
+            (typeof delta.reasoning_content === 'string' && delta.reasoning_content) ||
+            (typeof delta.reasoning === 'string' && delta.reasoning) ||
+            (typeof delta.reasoning_text === 'string' && delta.reasoning_text) ||
             '';
-        }
 
-
-        if (
-          pendingDelta
-        ) {
-          send({
-            type:
-              'delta',
-
-            text:
-              pendingDelta
-          });
-
-          pendingDelta =
-            '';
-        }
-      }
-
-
-      function scheduleFlush() {
-        if (
-          flushTimer ||
-          closed
-        ) {
-          return;
-        }
-
-        flushTimer =
-          setTimeout(
-            flushPending,
-            FLUSH_MS
-          );
-      }
-
-
-      reader =
-        upstream
-          .body
-          .getReader();
-
-
-      const decoder =
-        new TextDecoder();
-
-
-      let sseBuffer =
-        '';
-
-
-      try {
-
-        while (
-          true
-        ) {
-
-          const {
-            done,
-            value
-          } =
-            await reader.read();
-
-
-          if (
-            done
-          ) {
-            break;
+          if (reasoningPiece) {
+            pendingThinking += reasoningPiece;
+            reasoningContentAcc += reasoningPiece;
+            flushPending();
+            if (overBudget()) {
+              budgetCut = true;
+              try { reader.cancel(); } catch (e) { /* ignora */ }
+              break outer;
+            }
           }
 
+          // content (pode trazer <think>...</think> embutido)
+          if (typeof delta.content === 'string' && delta.content) {
+            const parts = think.feed(delta.content);
 
-          sawAnyChunk =
-            true;
-
-
-          sseBuffer +=
-            decoder.decode(
-              value,
-              {
-                stream:
-                  true
-              }
-            );
-
-          // SSE pode chegar com LF ou CRLF. Normalizamos apenas as quebras
-          // de evento para garantir que reasoning_content/tool_calls sejam
-          // processados em streaming através de relays/proxies diferentes.
-          sseBuffer = sseBuffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-
-          let idx;
-
-          while (
-            (
-              idx =
-                sseBuffer.indexOf(
-                  '\n\n'
-                )
-            ) !== -1
-          ) {
-
-            const rawEvent =
-              sseBuffer.slice(
-                0,
-                idx
-              );
-
-
-            sseBuffer =
-              sseBuffer.slice(
-                idx + 2
-              );
-
-
-            const line =
-              rawEvent
-                .split(
-                  '\n'
-                )
-                .find(
-                  function (
-                    l
-                  ) {
-                    return (
-                      l.indexOf(
-                        'data:'
-                      ) ===
-                      0
-                    );
-                  }
-                );
-
-
-            if (!line) {
-              continue;
-            }
-
-
-            const dataStr =
-              line
-                .slice(5)
-                .trim();
-
-
-            if (
-              !dataStr ||
-              dataStr ===
-                '[DONE]'
-            ) {
-              continue;
-            }
-
-
-            let evt;
-
-
-            try {
-              evt =
-                JSON.parse(
-                  dataStr
-                );
-            } catch (
-              e
-            ) {
-              continue;
-            }
-
-
-            const choice =
-              evt.choices &&
-              evt.choices[0];
-
-
-            if (!choice) {
-              continue;
-            }
-
-
-            const delta =
-              choice.delta ||
-              {};
-
-
-            // Step 5 Preview (via NVIDIA) envia reasoning_content no streaming. Alguns
-            // relays compatíveis podem normalizar o campo para
-            // reasoning/reasoning_text, então aceitamos essas variantes sem
-            // depender de <think> dentro do conteúdo visível.
-            const reasoningPiece =
-              (typeof delta.reasoning_content === 'string' && delta.reasoning_content) ||
-              (typeof delta.reasoning === 'string' && delta.reasoning) ||
-              (typeof delta.reasoning_text === 'string' && delta.reasoning_text) ||
-              '';
-
-            if (reasoningPiece) {
-              // Para o Tato 4.1, envie cada fragmento de reasoning assim que
-              // chegar. Isso reproduz o comportamento de streaming do modelo.
-              pendingThinking += reasoningPiece;
-              reasoningContentAcc += reasoningPiece;
-              registerThinking(reasoningPiece);
-              flushPending();
-
-              if (
-                !thinkingCutDone &&
-                !contentAcc &&
-                !toolCallsAcc.length &&
-                reasoningContentAcc.length > thinkDecision.budget
-              ) {
+            if (parts.thinking) {
+              pendingThinking += parts.thinking;
+              reasoningContentAcc += parts.thinking;
+              scheduleFlush();
+              if (overBudget()) {
                 budgetCut = true;
+                flushPending();
                 try { reader.cancel(); } catch (e) { /* ignora */ }
-                break;
+                break outer;
               }
             }
 
-
-            // content
-            if (
-              typeof
-                delta.content ===
-                'string' &&
-              delta.content
-            ) {
-
-              const parts =
-                think.feed(
-                  delta.content
-                );
-
-
-              if (
-                parts.thinking
-              ) {
-
-                pendingThinking +=
-                  parts.thinking;
-
-                reasoningContentAcc +=
-                  parts.thinking;
-
-                registerThinking(parts.thinking);
-                scheduleFlush();
-              }
-
-
-              if (
-                parts.visible
-              ) {
-
-                contentAcc +=
-                  parts.visible;
-
-                pendingDelta +=
-                  parts.visible;
-
-                scheduleFlush();
-              }
-            }
-
-
-            // tool calls
-            if (
-              Array.isArray(
-                delta.tool_calls
-              )
-            ) {
-
-              for (
-                const tc of
-                  delta.tool_calls
-              ) {
-
-                const i =
-                  typeof
-                    tc.index ===
-                    'number'
-                    ? tc.index
-                    : 0;
-
-
-                if (
-                  !toolCallsAcc[i]
-                ) {
-                  toolCallsAcc[i] = {
-                    id:
-                      '',
-
-                    type:
-                      'function',
-
-                    function: {
-                      name:
-                        '',
-
-                      arguments:
-                        ''
-                    }
-                  };
-                }
-
-
-                if (
-                  tc.id
-                ) {
-                  toolCallsAcc[i].id =
-                    tc.id;
-                }
-
-
-                if (
-                  tc.function &&
-                  tc.function.name
-                ) {
-                  toolCallsAcc[i]
-                    .function
-                    .name +=
-                    tc.function.name;
-                }
-
-
-                let streamedToolDelta = false;
-                if (
-                  tc.function &&
-                  typeof
-                    tc.function.arguments ===
-                      'string'
-                ) {
-                  toolCallsAcc[i]
-                    .function
-                    .arguments +=
-                    tc.function.arguments;
-                  streamedToolDelta = true;
-                }
-
-                if (tc.function && tc.function.name) {
-                  streamedToolDelta = true;
-                }
-
-                if (streamedToolDelta) {
-                  send({
-                    type: 'tool_delta',
-                    index: i,
-                    id: tc.id || toolCallsAcc[i].id || '',
-                    name: tc.function && tc.function.name
-                      ? tc.function.name
-                      : toolCallsAcc[i].function.name,
-                    arguments: tc.function && typeof tc.function.arguments === 'string'
-                      ? tc.function.arguments
-                      : ''
-                  });
-                }
-              }
-            }
-
-
-            if (
-              choice.finish_reason
-            ) {
-              finishReason =
-                choice.finish_reason;
+            if (parts.visible) {
+              contentAcc += parts.visible;
+              pendingDelta += parts.visible;
+              scheduleFlush();
             }
           }
+
+          // tool calls
+          if (Array.isArray(delta.tool_calls)) {
+            for (const tc of delta.tool_calls) {
+              const i = typeof tc.index === 'number' ? tc.index : 0;
+
+              if (!toolCallsAcc[i]) {
+                toolCallsAcc[i] = { id: '', type: 'function', function: { name: '', arguments: '' } };
+              }
+
+              if (tc.id) toolCallsAcc[i].id = tc.id;
+              if (tc.function && tc.function.name) toolCallsAcc[i].function.name += tc.function.name;
+
+              let streamedToolDelta = false;
+              if (tc.function && typeof tc.function.arguments === 'string') {
+                toolCallsAcc[i].function.arguments += tc.function.arguments;
+                streamedToolDelta = true;
+              }
+              if (tc.function && tc.function.name) streamedToolDelta = true;
+
+              if (streamedToolDelta) {
+                send({
+                  type: 'tool_delta',
+                  index: i,
+                  id: tc.id || toolCallsAcc[i].id || '',
+                  name: tc.function && tc.function.name ? tc.function.name : toolCallsAcc[i].function.name,
+                  arguments: tc.function && typeof tc.function.arguments === 'string' ? tc.function.arguments : ''
+                });
+              }
+            }
+          }
+
+          if (choice.finish_reason) finishReason = choice.finish_reason;
         }
-
-      } catch (
-        err
-      ) {
-
-        flushPending();
-
-
-        send({
-          type:
-            'error',
-
-          error:
-            'Conexão com a IA caiu no meio do streaming: ' +
-            (
-              err &&
-              err.message ||
-              err
-            )
-        });
-
-
-        finish();
-
-        return;
       }
-
-
-      if (budgetCut) {
-        thinkingCutDone = true;
-        flushPending();
-        console.warn('[Tato 4.1] Orçamento de raciocínio estourado (' + reasoningContentAcc.length + ' chars) — refazendo sem raciocínio.');
-        payload.chat_template_kwargs.enable_thinking = false;
-        payload.messages.push({
-          role: 'system',
-          content: lang === 'en-US'
-            ? 'You have already reflected enough. Act now, directly: call the needed tool or write the final answer. Do not deliberate further.'
-            : 'Você já refletiu o suficiente. Aja agora, direto: chame a ferramenta necessária ou escreva a resposta final. Não delibere mais.'
-        });
-        const cutRetry = await requestUpstreamWithRetry();
-        if (cutRetry.fatal || !cutRetry.upstream) {
-          send({ type: 'error', error: 'Server sobrecarregado, tente novamente mais tarde.' });
-          finish();
-          return;
-        }
-        upstream = cutRetry.upstream;
-        emptyAttempt--; // não gasta uma das tentativas de "resposta vazia"
-        continue;
-      }
-
-
-      // Processa qualquer texto final que o decoder ainda tenha mantido no buffer.
-      const decoderRemainder = decoder.decode();
-      if (decoderRemainder) {
-        sseBuffer += decoderRemainder.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-      }
-
-      const leftover =
-        think.flushRemainder();
-
-
-      if (
-        leftover.visible
-      ) {
-
-        contentAcc +=
-          leftover.visible;
-
-        pendingDelta +=
-          leftover.visible;
-      }
-
-
+    } catch (err) {
       flushPending();
-
-
-      if (
-        !sawAnyChunk
-      ) {
-
-        if (emptyAttempt < MAX_EMPTY_RETRIES) {
-          console.warn('[Tato 4.1] Stream vazio (tentativa ' + (emptyAttempt + 1) + '/' + (MAX_EMPTY_RETRIES + 1) + '), tentando de novo silenciosamente.');
-          const retryResult = await requestUpstreamWithRetry();
-          if (retryResult.fatal || !retryResult.upstream) {
-            send({ type: 'error', error: 'A IA não retornou nenhum dado (stream vazio).' });
-            finish();
-            return;
-          }
-          upstream = retryResult.upstream;
-          continue;
-        }
-
-        send({
-          type:
-            'error',
-
-          error:
-            'A IA não retornou nenhum dado (stream vazio).'
-        });
-
-
-        finish();
-
-        return;
-      }
-
-
-      // ==========================================================
-      // DEDUPE TOOL CALLS
-      // ==========================================================
-
-      function dedupeToolCalls(
-        calls
-      ) {
-        const seen =
-          new Set();
-
-        const out =
-          [];
-
-
-        for (
-          const tc of
-            calls
-        ) {
-
-          const key =
-            (
-              tc.function &&
-              tc.function.name ||
-              ''
-            ) +
-            '\u0000' +
-            (
-              tc.function &&
-              tc.function.arguments ||
-              ''
-            );
-
-
-          if (
-            seen.has(
-              key
-            )
-          ) {
-            continue;
-          }
-
-
-          seen.add(
-            key
-          );
-
-
-          out.push(
-            tc
-          );
-        }
-
-
-        return out;
-      }
-
-
-      const cleanToolCalls =
-        dedupeToolCalls(
-          toolCallsAcc.filter(
-            Boolean
-          )
-        );
-
-
-      if (
-        cleanToolCalls.length
-      ) {
-
-        send({
-          type:
-            'done',
-
-          message: {
-            role:
-              'assistant',
-
-            content:
-              contentAcc ||
-              null,
-
-            ...(reasoningContentAcc
-              ? { reasoning_content: reasoningContentAcc }
-              : {}),
-
-            tool_calls:
-              cleanToolCalls
-          },
-
-          limitReached:
-            false
-        });
-
-
-        finish();
-
-        return;
-      }
-
-
-      // ==========================================================
-      // RESPOSTA NORMAL
-      // ==========================================================
-
-      let reply =
-        contentAcc.trim();
-
-
-      if (
-        !reply
-      ) {
-
-        // Resposta veio vazia (só reasoning, sem texto visível e sem
-        // tool_calls). Se não foi por ter batido o limite de tokens (esse
-        // caso é um problema real de orçamento, não vale retry) e ainda
-        // sobrarem tentativas, tenta a mesma requisição de novo em vez de
-        // já devolver erro pro usuário — na prática resolve a maioria dos
-        // casos, já que é uma falha de geração pontual do modelo.
-        if (finishReason !== 'length' && emptyAttempt < MAX_EMPTY_RETRIES) {
-          console.warn('[Tato 4.1] Resposta final vazia (tentativa ' + (emptyAttempt + 1) + '/' + (MAX_EMPTY_RETRIES + 1) + '), tentando de novo silenciosamente. finishReason=' + finishReason);
-          const retryResult = await requestUpstreamWithRetry();
-          if (retryResult.fatal || !retryResult.upstream) {
-            send({ type: 'error', error: 'A IA não retornou uma resposta.' });
-            finish();
-            return;
-          }
-          upstream = retryResult.upstream;
-          continue;
-        }
-
-        const reason =
-          finishReason ===
-            'length'
-
-            ?
-
-          'A IA gastou todo o limite de tokens pensando e não sobrou espaço para a resposta visível. ' +
-          'O Tato 4.1 está com reasoning ativado e o limite é 256K tokens.'
-
-            :
-
-          'A IA não retornou uma resposta.';
-
-
-        send({
-          type:
-            'error',
-
-          error:
-            reason
-        });
-
-
-        finish();
-
-        return;
-      }
-
-
-      let limitReached =
-        false;
-
-
-      if (
-        finishReason ===
-        'length'
-      ) {
-
-        const trimmed =
-          trimToSafeBoundary(
-            reply
-          );
-
-
-        if (
-          trimmed
-        ) {
-          reply =
-            trimmed;
-        }
-
-
-        limitReached =
-          true;
-      }
-
-
-      send({
-        type:
-          'done',
-
-        message: {
-          role:
-            'assistant',
-
-          content:
-            reply,
-
-          ...(reasoningContentAcc
-            ? { reasoning_content: reasoningContentAcc }
-            : {})
-        },
-
-        limitReached:
-          limitReached,
-        modelMode:
-          modelMode,
-        reasoningCheckpoint:
-          false
-      });
-
-
+      send({ type: 'error', error: 'Conexão com a IA caiu no meio do streaming: ' + (err && err.message || err) });
       finish();
       return;
     }
+
+
+    if (budgetCut) {
+      thinkingCutDone = true;
+      flushPending();
+      console.warn('[Tato 4.1] Orçamento de raciocínio estourado (~' + Math.ceil(reasoningContentAcc.length / CHARS_PER_TOKEN) + ' de ' + thinkBudgetTokens + ' tokens) — refazendo sem raciocínio.');
+      payload.chat_template_kwargs = thinkingKwargs(false);
+      // Vai como mensagem de usuário (o template do Nemotron só aceita
+      // system no começo da conversa).
+      payload.messages.push({
+        role: 'user',
+        content: lang === 'en-US'
+          ? '[System instruction] You have already reflected enough. Act now, directly: call the needed tool or write the final answer. Do not deliberate further.'
+          : '[Instrução do sistema] Você já refletiu o suficiente. Aja agora, direto: chame a ferramenta necessária ou escreva a resposta final. Não delibere mais.'
+      });
+      const cutRetry = await requestUpstreamWithRetry();
+      if (cutRetry.fatal || !cutRetry.upstream) {
+        send({ type: 'error', error: 'Server sobrecarregado, tente novamente mais tarde.' });
+        finish();
+        return;
+      }
+      upstream = cutRetry.upstream;
+      emptyAttempt--; // não gasta uma das tentativas de "resposta vazia"
+      continue;
+    }
+
+
+    // Processa qualquer texto final que o decoder ainda tenha mantido no buffer.
+    const decoderRemainder = decoder.decode();
+    if (decoderRemainder) {
+      sseBuffer += decoderRemainder.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    }
+
+    const leftover = think.flushRemainder();
+    if (leftover.visible) {
+      contentAcc += leftover.visible;
+      pendingDelta += leftover.visible;
+    }
+    if (leftover.thinking) {
+      pendingThinking += leftover.thinking;
+      reasoningContentAcc += leftover.thinking;
+    }
+
+    flushPending();
+
+
+    if (!sawAnyChunk) {
+      if (emptyAttempt < MAX_EMPTY_RETRIES) {
+        console.warn('[Tato 4.1] Stream vazio (tentativa ' + (emptyAttempt + 1) + '/' + (MAX_EMPTY_RETRIES + 1) + '), tentando de novo silenciosamente.');
+        const retryResult = await requestUpstreamWithRetry();
+        if (retryResult.fatal || !retryResult.upstream) {
+          send({ type: 'error', error: 'A IA não retornou nenhum dado (stream vazio).' });
+          finish();
+          return;
+        }
+        upstream = retryResult.upstream;
+        continue;
+      }
+
+      send({ type: 'error', error: 'A IA não retornou nenhum dado (stream vazio).' });
+      finish();
+      return;
+    }
+
+
+    // ==========================================================
+    // DEDUPE TOOL CALLS
+    // ==========================================================
+
+    function dedupeToolCalls(calls) {
+      const seen = new Set();
+      const out = [];
+      for (const tc of calls) {
+        const key = (tc.function && tc.function.name || '') + '\u0000' + (tc.function && tc.function.arguments || '');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (!tc.id) tc.id = 'call_' + Math.random().toString(36).slice(2, 12);
+        out.push(tc);
+      }
+      return out;
+    }
+
+    const cleanToolCalls = dedupeToolCalls(
+      toolCallsAcc.filter(function (tc) { return tc && tc.function && tc.function.name; })
+    );
+
+    if (cleanToolCalls.length) {
+      send({
+        type: 'done',
+        message: {
+          role: 'assistant',
+          content: contentAcc || null,
+          ...(reasoningContentAcc ? { reasoning_content: reasoningContentAcc } : {}),
+          tool_calls: cleanToolCalls
+        },
+        limitReached: false
+      });
+      finish();
+      return;
+    }
+
+
+    // ==========================================================
+    // RESPOSTA NORMAL
+    // ==========================================================
+
+    let reply = contentAcc.trim();
+
+    if (!reply) {
+      // Resposta veio vazia (só reasoning, sem texto visível e sem
+      // tool_calls). Se não foi por ter batido o limite de tokens e ainda
+      // sobrarem tentativas, tenta de novo em silêncio.
+      if (finishReason !== 'length' && emptyAttempt < MAX_EMPTY_RETRIES) {
+        console.warn('[Tato 4.1] Resposta final vazia (tentativa ' + (emptyAttempt + 1) + '/' + (MAX_EMPTY_RETRIES + 1) + '), tentando de novo silenciosamente. finishReason=' + finishReason);
+        const retryResult = await requestUpstreamWithRetry();
+        if (retryResult.fatal || !retryResult.upstream) {
+          send({ type: 'error', error: 'A IA não retornou uma resposta.' });
+          finish();
+          return;
+        }
+        upstream = retryResult.upstream;
+        continue;
+      }
+
+      const reason = finishReason === 'length'
+        ? 'A IA gastou todo o limite de tokens pensando e não sobrou espaço para a resposta visível. ' +
+          'O limite atual de saída do Tato 4.1 é ' + payload.max_tokens + ' tokens.'
+        : 'A IA não retornou uma resposta.';
+
+      send({ type: 'error', error: reason });
+      finish();
+      return;
+    }
+
+    let limitReached = false;
+
+    if (finishReason === 'length') {
+      const trimmed = trimToSafeBoundary(reply);
+      if (trimmed) reply = trimmed;
+      limitReached = true;
+    }
+
+    send({
+      type: 'done',
+      message: {
+        role: 'assistant',
+        content: reply,
+        ...(reasoningContentAcc ? { reasoning_content: reasoningContentAcc } : {})
+      },
+      limitReached: limitReached,
+      modelMode: modelMode,
+      reasoningCheckpoint: false
+    });
+
+    finish();
+    return;
   }
-);
+});
 
 
 // ============================================================
@@ -2623,17 +1566,9 @@ const HOST = '0.0.0.0';
 
 // Render fica na frente do Node com um proxy HTTP.
 // Mantemos conexões longas para o streaming SSE da IA.
-const httpServer = app.listen(
-  PORT,
-  HOST,
-  function () {
-    console.log(
-      'Tato server rodando em http://' +
-      HOST + ':' +
-      PORT
-    );
-  }
-);
+const httpServer = app.listen(PORT, HOST, function () {
+  console.log('Tato server rodando em http://' + HOST + ':' + PORT + ' — modelo ' + MODEL);
+});
 
 // Evita que o próprio Node encerre conexões longas antes do streaming terminar.
 httpServer.keepAliveTimeout = 120000;
