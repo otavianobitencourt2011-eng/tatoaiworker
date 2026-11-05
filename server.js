@@ -15,6 +15,7 @@
 // ============================================================
 
 import express from 'express';
+import { readFileSync } from 'fs';
 
 const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
 // ID confirmado na NVIDIA Build: nvidia/nemotron-3.5-super-vl-120b-a12b.
@@ -786,6 +787,42 @@ function limitHistoryImages(history) {
 
 
 // ============================================================
+// MODO CONSTRUTOR (jogos, apps, sites) — system prompt grande
+// ============================================================
+// O arquivo tato-builder-system-prompt.md fica na MESMA pasta deste
+// servidor no git. Ele é lido uma vez quando o servidor liga e só entra
+// na conversa quando o pedido é de construção — pedidos comuns não pagam
+// os ~22 mil tokens dele.
+let BUILDER_PROMPT = '';
+try {
+  BUILDER_PROMPT = readFileSync(new URL('./tato-builder-system-prompt.md', import.meta.url), 'utf8').trim();
+  console.log('[Tato 4.1] Modo Construtor carregado:', BUILDER_PROMPT.length, 'caracteres');
+} catch (e) {
+  console.warn('[Tato 4.1] tato-builder-system-prompt.md não encontrado — Modo Construtor desligado.');
+}
+
+// Pedido de construção: criar/melhorar/corrigir jogo, app, site, página, ferramenta...
+const BUILD_OBJECT_RE = /\b(jogo|joguinho|game|app|aplicativo|aplicacao|site|website|landing|pagina|portfolio|dashboard|painel|sistema|ferramenta|calculadora|conversor|cronometro|timer|pomodoro|to-?do|lista de tarefas|controle de|gerenciador|simulador|quiz|formulario|cardapio|loja|tela|interface|layout|html|css|canvas|tetris|snake|cobrinha|flappy|2048|plataforma|tabuleiro|xadrez|damas|velha|clicker|idle|rpg)\b/;
+const BUILD_VERB_RE = /\b(cri[ae]|criar|faz|faca|fazer|monta|montar|gera|gerar|desenvolv|program|constro|construir|implement|adicion|coloc|melhor|corrig|conserta|arrum|ajust|refaz|refazer|deixa|muda|mudar|atualiz|responsiv|anima)/;
+
+function isBuildRequest(history) {
+  const t = normalizeText(getLatestUserMessage(history));
+  if (!t) return false;
+  if (BUILD_OBJECT_RE.test(t) && BUILD_VERB_RE.test(t)) return true;
+  // Continua no modo se a conversa recente já está construindo um projeto
+  // (arquivos .html sendo escritos/editados nas últimas rodadas).
+  const recent = history.slice(-12);
+  return recent.some(function (m) {
+    return m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.some(function (tc) {
+      const name = tc && tc.function && tc.function.name;
+      const args = tc && tc.function && tc.function.arguments || '';
+      return /^(write_file|edit_file|test_html_sandbox|screenshot_html)$/.test(name || '') && /\.html?\b/i.test(args);
+    });
+  });
+}
+
+
+// ============================================================
 // MONTAGEM DAS MENSAGENS PRO NEMOTRON
 // ============================================================
 
@@ -1063,12 +1100,21 @@ app.post('/', async function (req, res) {
 
   const imageContext = normalizeImageContext(body, tools);
 
+  // Modo Construtor: só carrega o prompt grande quando o pedido é de construção.
+  const builderMode = !!BUILDER_PROMPT && isBuildRequest(history);
+  if (builderMode) console.log('[Tato 4.1] Modo Construtor ATIVO nesta resposta');
+
   const reminders = [
     FILE_REMINDER,
     buildDateReminder(lang),
     buildLangReminder(lang),
     buildImageReminder(lang, imageContext, tools),
     buildThinkingReminder(lang),
+    builderMode
+      ? 'LEMBRETE DO MODO CONSTRUTOR: siga o system prompt do Modo Construtor. Nenhum arquivo é entregue sem ' +
+        'verificação REAL com Node.js nesta resposta (sintaxe, estrutura, lógica), seguida de test_html_sandbox e ' +
+        'screenshot_html. Sem Node.js rodado e aprovado, não está pronto.'
+      : '',
     explicitGithubRequest && hasGithubTool
       ? 'GITHUB TOOL OVERRIDE: o pedido atual do usuário menciona explicitamente GitHub. ' +
         'É OBRIGATÓRIO chamar a ferramenta github nesta resposta antes de responder. ' +
@@ -1080,7 +1126,11 @@ app.post('/', async function (req, res) {
 
   const payload = {
     model: MODEL,
-    messages: buildMessages(buildSystemPrompt(lang, imageContext), history, reminders),
+    messages: buildMessages(
+      buildSystemPrompt(lang, imageContext) + (builderMode ? '\n\n' + BUILDER_PROMPT : ''),
+      history,
+      reminders
+    ),
     // Limite máximo de saída: 320K tokens (com fallback automático se o
     // endpoint recusar). O corpo JSON aceita até 35 MB para mensagens
     // multimodais com imagens Base64 e histórico textual.
