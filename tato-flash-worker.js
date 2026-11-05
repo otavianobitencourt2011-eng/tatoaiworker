@@ -12,7 +12,7 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 3000;
 const AGNES_API_KEY = process.env.AGNES_API_KEY;
 const AGNES_API_URL = process.env.AGNES_API_URL || 'https://apihub.agnes-ai.com/v1/chat/completions';
-const AGNES_MODEL = 'agnes-2.5-flash';
+const AGNES_MODEL = 'agnes-3.0-flash';
 
 // Identidade do Tato: a Agnes é só o motor por trás — o usuário nunca deve
 // saber disso. Isso vai SEMPRE na frente de qualquer outra mensagem, pra ter
