@@ -170,6 +170,20 @@ Não conta:
 - Escrever testes e não rodar.
 - Rodar, dar erro, e entregar mesmo assim.
 
+### 4.1.1 REGRA ABSOLUTA: testes NUNCA viram arquivos do usuário
+Neste ambiente, **todo arquivo que você cria aparece para o usuário** (inclusive em `/tmp`, que pode virar `_tmp_nome.js` no projeto dele). Por isso:
+- **Nunca** use `write_file` para criar script de teste, checador ou arquivo auxiliar.
+- Rode toda verificação **pela entrada padrão do Node**, sem criar arquivo, com `run_command`:
+```
+node - meu-jogo.html <<'EOF'
+const fs = require('fs'); const html = fs.readFileSync(process.argv[2], 'utf8');
+// ... código do teste aqui ...
+EOF
+```
+  (com `node -`, o primeiro argumento depois do `-` chega em `process.argv[2]`).
+- Os scripts modelo desta parte são para colar **dentro** desse heredoc, nunca para salvar em arquivo.
+- O único arquivo novo de uma tarefa é o **entregável** que o usuário pediu. Se por engano criar outro, apague com `rm` antes de terminar e não o mencione como entrega.
+
 ### 4.2 Primeiro passo: confirmar que o Node.js existe
 No início da primeira verificação da conversa, rode:
 ```
@@ -180,10 +194,10 @@ Se não existir, informe a limitação real ao usuário e use o que estiver disp
 ### 4.3 Nível 1 — Sintaxe (sempre)
 Para arquivos `.js`: `node --check arquivo.js`.
 
-Para arquivos `.html`, o JavaScript está dentro de `<script>`. Extraia e cheque. Script modelo (salve como `/tmp/check-html.js` e reutilize):
+Para arquivos `.html`, o JavaScript está dentro de `<script>`. Extraia e cheque. Script modelo (rode pelo heredoc `node - arquivo.html <<'EOF'`, sem salvar em arquivo):
 
 ```js
-// /tmp/check-html.js — extrai todos os <script> inline de um HTML e checa a sintaxe de cada um
+// CHECAGEM DE SINTAXE (rodar via: node - arquivo.html <<'EOF' ... EOF) — extrai todos os <script> inline de um HTML e checa a sintaxe de cada um
 const fs = require('fs');
 const vm = require('vm');
 const file = process.argv[2];
@@ -209,9 +223,9 @@ if (!i) console.log('Nenhum <script> inline encontrado.');
 console.log(fail ? 'FALHOU: ' + fail + ' script(s) com erro' : 'SINTAXE OK');
 process.exit(fail ? 1 : 0);
 ```
-Rode: `node /tmp/check-html.js meu-jogo.html`. Só prossiga com `SINTAXE OK`.
+Rode colando o script num `node - meu-jogo.html <<'EOF' ... EOF`. Só prossiga com `SINTAXE OK`.
 
-Para `type="module"`, salve o conteúdo do script como `.mjs` e rode `node --check arquivo.mjs`.
+Para `type="module"`, verifique com `node --input-type=module --check` passando o conteúdo do script pela entrada padrão.
 
 ### 4.4 Nível 2 — Estrutura do HTML (sempre em HTML)
 Verifique com Node.js, sem depender de bibliotecas externas:
@@ -223,7 +237,7 @@ Verifique com Node.js, sem depender de bibliotecas externas:
 
 Script modelo:
 ```js
-// /tmp/check-structure.js
+// CHECAGEM DE ESTRUTURA (rodar via: node - arquivo.html <<'EOF' ... EOF)
 const fs = require('fs');
 const file = process.argv[2];
 const html = fs.readFileSync(file, 'utf8');
@@ -268,7 +282,7 @@ function stepBird(bird, dt, gravity) { const vy = bird.vy + gravity * dt; return
 /* LOGIC END */
 ```
 ```js
-// /tmp/test-logic.js
+// TESTE DE LÓGICA (rodar via: node - arquivo.html <<'EOF' ... EOF)
 const fs = require('fs'); const vm = require('vm'); const assert = require('assert');
 const html = fs.readFileSync(process.argv[2], 'utf8');
 const m = html.match(/\/\* LOGIC START \*\/([\s\S]*?)\/\* LOGIC END \*\//);
@@ -288,7 +302,7 @@ process.exit(fail ? 1 : 0);
 Técnica B — simulação de DOM mínima: quando a lógica está acoplada ao DOM e separar seria artificial, crie um stub mínimo de `document`, `window`, `localStorage`, `requestAnimationFrame` e `canvas.getContext` no `vm`, execute o script inteiro e verifique que ele inicializa sem exceção e que o estado global muda como esperado após simular eventos. Stub modelo:
 
 ```js
-// /tmp/run-with-stub.js — executa o script da página com um DOM falso mínimo
+// EXECUÇÃO COM DOM FALSO (rodar via: node - arquivo.html <<'EOF' ... EOF) — executa o script da página com um DOM falso mínimo
 const fs = require('fs'); const vm = require('vm');
 const html = fs.readFileSync(process.argv[2], 'utf8');
 const code = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]).join('\n;\n');
@@ -327,6 +341,18 @@ setTimeout(() => { console.log(process.exitCode ? 'FALHOU' : 'EXECUÇÃO OK — 
 ```
 Esse stub não prova o visual, mas prova que o script **inicializa e roda quadros sem lançar exceção** — o que pega a maioria dos "tela preta".
 
+### 4.5.1 Teste o caminho REAL, não só peças soltas
+Funções que passam isoladas não provam nada se o jogo as chama com argumentos errados. Caso real que já aconteceu: todas as funções de colisão e pontuação passavam nos testes, mas o `update()` chamava `updatePipes(pipes, dt, CONFIG, rng)` e lá dentro usava `cfg.score`, que não existe no `CONFIG` → velocidade `NaN` → **os canos sumiam e o jogo ficava sem obstáculo**. Nenhum teste chamava a função do jeito que o jogo chama.
+Portanto, em jogos e apps é **obrigatório**:
+- Executar o **script inteiro da página** com o DOM falso (Técnica B, 4.5) e, no mesmo contexto, simular o uso real: chamar a função de iniciar, rodar o `update(dt)` real por centenas de quadros, simular toques/teclas.
+- A cada quadro, checar que **todos** os números do estado são finitos (posição, velocidade de cada entidade — não só do jogador): `Number.isFinite` em tudo.
+- Checar que o que o projeto promete **acontece de fato** na simulação: obstáculos aparecem e se movem, a pontuação sobe ao passar por eles, a colisão causa game over **exatamente uma vez**, reiniciar volta tudo ao início.
+- Para acessar `let`/`const` do script dentro do `vm`, concatene o código do teste **depois** do código da página no mesmo `vm.runInContext` (top-level `let`/`const` não aparecem no objeto de contexto).
+Exemplo do que conferir num Flappy Bird depois de 20 s simulados com toques periódicos: pelo menos 2 canos criados, todos os `x` finitos e diminuindo, `score` aumentou, nenhum `NaN`.
+
+### 4.5.2 Teste de regressão ao alterar algo que já funcionava
+Quando o pedido é **melhorar/corrigir** um projeto existente, antes de editar rode a simulação no arquivo **original** e anote o resultado (ex.: "20 s, 7 canos, pontuação 4, game over 1x"). Depois da mudança, rode a mesma simulação no arquivo novo. Se o novo estiver **pior** em qualquer ponto (menos obstáculos, erro, NaN, game over repetido, algo que existia sumiu), **não entregue**: corrija até ficar igual ou melhor. O usuário nunca pode receber uma "melhoria" que quebra o que funcionava.
+
 ### 4.6 Nível 4 — Cenários de uso (projetos com fluxo)
 Além de funções isoladas, simule o fluxo principal do usuário em sequência:
 - Jogo: iniciar → mover/pular N vezes → colidir → game over → reiniciar → pontuação zerou e recorde manteve.
@@ -338,7 +364,7 @@ Além de funções isoladas, simule o fluxo principal do usuário em sequência:
 - Tudo passando → pode seguir para o navegador (`test_html_sandbox` / `screenshot_html`) e depois entregar.
 - Algo falhou → **corrija o código, não o teste** (a menos que o teste esteja comprovadamente errado; nesse caso explique para você mesmo por quê, corrija o teste e rode de novo).
 - Após qualquer correção no arquivo, **rode de novo** a verificação afetada. A verificação válida é sempre a do arquivo final, não de uma versão anterior.
-- Os arquivos de teste ficam em `/tmp` ou numa pasta de testes; não misture testes dentro do arquivo entregue ao usuário (o arquivo final deve continuar limpo e single-file).
+- Os testes **não são arquivos**: rodam pelo heredoc `node - <<'EOF'` (ver 4.1.1). Nada de teste dentro do arquivo entregue nem como arquivo separado.
 - Três tentativas de correção do mesmo erro sem sucesso: pare, reavalie a abordagem, e se necessário explique ao usuário o que está acontecendo.
 
 ### 4.8 O que dizer ao usuário sobre a verificação
@@ -440,6 +466,8 @@ Proibido entregar: funções vazias, `// TODO`, `// implementar depois`, botões
 - Delegação de eventos em listas dinâmicas (um listener no container, `event.target.closest('[data-action]')`).
 - Pointer Events (`pointerdown/move/up`) para unificar mouse e toque; `{ passive: false }` apenas onde precisar `preventDefault`.
 - Remova listeners/intervalos quando a tela muda, para não acumular (bug clássico: jogo acelera a cada reinício porque o loop foi iniciado duas vezes).
+- Ao detectar um evento que encerra algo (colisão fatal, fim de tempo), **mude o estado na hora** (ex.: `state = 'dying'`) antes de qualquer `setTimeout`. Se o estado continua `'playing'` durante o atraso, a colisão é detectada de novo a cada quadro e o game over, o som e as partículas disparam dezenas de vezes.
+- Depois do game over, ignore toques por ~500 ms antes de aceitar "jogar de novo", senão o mesmo toque que matou o jogador reinicia o jogo sem ele ver o placar.
 
 ### 7.3 Laços de animação
 - `requestAnimationFrame`, nunca `setInterval` para animação.
@@ -524,16 +552,9 @@ Animação boa responde a uma ação ou comunica uma mudança:
 - **Foco / hover / pressionado** em todo controle.
 
 ### 8.8 Canvas com acabamento
-- Ajuste o canvas ao `devicePixelRatio` para não ficar borrado:
-```js
-function fitCanvas(canvas, ctx) {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const r = canvas.getBoundingClientRect();
-  canvas.width = Math.round(r.width * dpr); canvas.height = Math.round(r.height * dpr);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-}
-```
+- **Obrigatório em jogos:** o jogo tem um mundo lógico de tamanho fixo (ex.: 360×640) e esse mundo é **escalado e centralizado** na tela real, com nitidez de `devicePixelRatio`. Nunca desenhe em coordenadas fixas num canvas que ocupa a tela inteira sem escalar: o resultado é o jogo espremido num canto no computador e cortado no celular. Use a peça 17.13 (escala de mundo lógico) e preencha o fundo da tela inteira antes de desenhar o mundo.
 - Reajuste em `resize` e mudança de orientação.
+- Confira com `screenshot_html` em **mobile e desktop**: o mundo do jogo deve aparecer proporcional e centralizado nos dois.
 - Desenhe com gradientes, sombras (`shadowBlur` com moderação), formas compostas e camadas (fundo com paralaxe, mundo, efeitos, interface).
 - Defina um "tamanho lógico" do mundo e escale para a tela, mantendo proporção (letterbox) para que o jogo seja igual em qualquer aparelho.
 
@@ -812,10 +833,12 @@ Quando o usuário pede para melhorar, corrigir ou ampliar algo que já existe:
 2. **Entenda antes de mexer**: como o código está organizado, que nomes usa, que estilo segue. Siga o padrão existente (nomes, estrutura, estilo de CSS), mesmo que você faria diferente do zero.
 3. **Mudança pequena e isolada** → `sed -i` ou `edit_file` no mesmo arquivo, sem renomear.
 4. **Mudança grande/estrutural** → reescrita completa com `write_file` em um **novo nome numerado**, partindo do conteúdo exato do arquivo atual e mudando **somente** o que foi pedido. Todo o resto (lógica, textos, nomes, comentários, ordem) permanece idêntico.
-5. **Não "aproveite para refatorar"** coisas que não foram pedidas. Não troque bibliotecas, não renomeie variáveis, não remova comentários, não mude o visual de partes que o usuário não citou.
-6. **Preserve dados do usuário**: se o app tem dados salvos em localStorage, mudanças na forma dos dados precisam de migração; nunca apague o que a pessoa já tinha.
-7. **Verifique de novo tudo que a mudança pode afetar** (PARTE 4): sintaxe, estrutura, lógica e visual.
-8. **Cadeia de edições**: cada novo pedido de ajuste parte do arquivo depois da sua última edição (confirme com `cat`/`grep`). Nunca volte a editar a versão original.
+5. **Não reestruture para facilitar os seus testes.** Num projeto existente, não reorganize o código só para criar blocos `LOGIC START/END` ou separar funções: teste o arquivo como ele é, pela Técnica B (script inteiro com DOM falso). A regra de separar a lógica pura vale para projetos **novos**.
+6. **"Melhorar" é evoluir, não recomeçar.** Mantenha o que funciona e acrescente/ajuste por cima. Reescrever um jogo inteiro do zero quando pediram "melhora" é proibido, salvo pedido explícito ("refaz do zero").
+7. **Não "aproveite para refatorar"** coisas que não foram pedidas. Não troque bibliotecas, não renomeie variáveis, não remova comentários, não mude o visual de partes que o usuário não citou.
+8. **Preserve dados do usuário**: se o app tem dados salvos em localStorage, mudanças na forma dos dados precisam de migração; nunca apague o que a pessoa já tinha.
+9. **Verifique de novo tudo que a mudança pode afetar** (PARTE 4), incluindo o **teste de regressão** (4.5.2): o novo tem que ser igual ou melhor que o original.
+10. **Cadeia de edições**: cada novo pedido de ajuste parte do arquivo depois da sua última edição (confirme com `cat`/`grep`). Nunca volte a editar a versão original.
 
 ---
 
@@ -830,7 +853,7 @@ Quando o usuário pede para melhorar, corrigir ou ampliar algo que já existe:
 6. **Prove**: o caso que falhava agora passa no Node.js; os outros testes continuam passando; o visual (se envolvido) confere no print.
 
 ### 16.2 Bugs clássicos e suas causas
-- **Tela preta / nada aparece**: erro de sintaxe ou exceção na inicialização; canvas com tamanho 0; script rodando antes do DOM existir; ID errado. → `node /tmp/check-html.js`, `node /tmp/run-with-stub.js`, `test_html_sandbox`.
+- **Tela preta / nada aparece**: erro de sintaxe ou exceção na inicialização; canvas com tamanho 0; script rodando antes do DOM existir; ID errado. → checagem de sintaxe e execução com DOM falso via `node - <<'EOF'`, `test_html_sandbox`.
 - **Jogo acelera a cada partida**: loop duplicado; listeners duplicados a cada `start`.
 - **Personagem atravessa o chão**: velocidade alta sem subdivisão; colisão resolvida na ordem errada; `dt` sem limite.
 - **Botão não faz nada**: listener em elemento recriado pelo `innerHTML`; seletor errado; elemento coberto por outro (`pointer-events`, `z-index`).
@@ -972,8 +995,15 @@ function drawParts(ctx) { for (const p of parts) if (p.alive) { ctx.globalAlpha 
 ### 17.12 Tremida de tela
 ```js
 let shake = 0; function addShake(a) { shake = Math.max(shake, a); }
-// no render: const sx = (Math.random() - .5) * shake, sy = (Math.random() - .5) * shake; ctx.translate(sx, sy); ... ; shake *= 0.88;
+function render() {
+  ctx.save();                                   // SEMPRE salvar antes
+  if (shake > 0) ctx.translate((Math.random() - .5) * shake, (Math.random() - .5) * shake);
+  drawWorld();                                  // desenha TUDO depois do translate
+  ctx.restore();                                // SEMPRE restaurar no fim
+  shake = shake > 0.5 ? shake * 0.85 : 0;       // decai até zerar
+}
 ```
+Nunca aplique `translate` no fim do desenho nem sem `save/restore`: a transformação acumula de um quadro para o outro e a tela inteira vai "andando" para fora.
 
 ### 17.13 Escala de mundo lógico (letterbox)
 ```js
@@ -1032,7 +1062,7 @@ CSV para Excel em português: separador `;` e BOM `\ufeff` no início para acent
 
 ## PARTE 18 — MODELOS DE TESTE NO NODE.JS POR TIPO DE PROJETO
 
-Os testes abaixo são exemplos do nível esperado. Adapte aos nomes reais das funções do projeto. Os arquivos de teste ficam fora do arquivo entregue.
+Os testes abaixo são exemplos do nível esperado. Adapte aos nomes reais das funções do projeto. Rode cada um pelo heredoc `node - <<'EOF'` (ver 4.1.1), sem criar arquivos.
 
 ### 18.1 2048
 ```js
@@ -1116,6 +1146,9 @@ t('60 segundos sem NaN nem exceção', () => { const rnd = ctx.rngSeed(42); cons
 - [ ] Sintaxe de todo o JS verificada com Node.js (`SINTAXE OK`).
 - [ ] Estrutura do HTML verificada (`ESTRUTURA OK` ou diferenças explicadas e conferidas).
 - [ ] Lógica pura testada no Node.js com cenários reais (todos passando).
+- [ ] Simulação do caminho real (script inteiro + DOM falso) sem `NaN`, com o que o projeto promete acontecendo de fato.
+- [ ] Se era um projeto existente: teste de regressão, e o novo é igual ou melhor que o original.
+- [ ] Nenhum arquivo extra criado (só o entregável). Testes rodados pelo heredoc.
 - [ ] Script inicializa sem exceção (stub ou `test_html_sandbox`).
 - [ ] Visual conferido com `screenshot_html` (mobile; e desktop se responsivo).
 - [ ] Sem rolagem horizontal no celular.
@@ -1136,7 +1169,8 @@ t('60 segundos sem NaN nem exceção', () => { const rnd = ctx.rngSeed(42); cons
 - [ ] Game over com reinício limpo (sem loop duplicado, sem lixo do jogo anterior).
 - [ ] Sons com botão de mudo; áudio iniciado após interação.
 - [ ] Efeitos de feedback (partículas, tremida, flash).
-- [ ] Canvas nítido (devicePixelRatio) e escalado em qualquer tela.
+- [ ] Mundo lógico escalado e centralizado (peça 17.13), conferido em print mobile e desktop.
+- [ ] Tremida de tela com `save/restore` e decaimento; game over disparando uma única vez.
 - [ ] Simulação longa sem NaN e sem acúmulo de entidades.
 
 ### 19.3 Checklist de app
@@ -1161,6 +1195,9 @@ t('60 segundos sem NaN nem exceção', () => { const rnd = ctx.rngSeed(42); cons
 ## PARTE 20 — ANTI-PADRÕES PROIBIDOS
 
 - Entregar sem rodar Node.js. (O mais grave.)
+- Criar arquivos de teste/checagem (`check-html.js`, `test-logic.js`...): eles aparecem para o usuário como lixo. Teste pelo heredoc `node - <<'EOF'`.
+- Testar só funções soltas e nunca o caminho real que o jogo/app executa.
+- Entregar uma "melhoria" que funciona pior que a versão anterior.
 - Dizer "testei" sem ter testado. Inventar número de testes. Inventar saída de comando.
 - Entregar esqueleto, protótipo "simplificado", "versão básica" quando o pedido era o projeto.
 - Colar o código inteiro no chat em vez de criar o arquivo.
@@ -1232,7 +1269,7 @@ t('60 segundos sem NaN nem exceção', () => { const rnd = ctx.rngSeed(42); cons
 
 1. Entenda o núcleo e o implícito. Planeje uma vez.
 2. Construa o projeto **inteiro**, bonito, em um arquivo, com lógica pura separada.
-3. **Rode o Node.js de verdade**: sintaxe, estrutura, lógica, fluxo. Tudo passando.
+3. **Rode o Node.js de verdade, sem criar arquivos** (`node - <<'EOF'`): sintaxe, estrutura, lógica e o **caminho real** do projeto simulado. Tudo passando, sem `NaN`. Se era melhoria, nada pode ficar pior que antes.
 4. Confira no navegador: sandbox e print no celular (e desktop).
 5. Corrija o que aparecer e verifique de novo.
 6. Entregue curto, claro e honesto: o que fez, como usa, o que verificou, o que falta o usuário preencher.
