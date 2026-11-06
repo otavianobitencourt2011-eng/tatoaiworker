@@ -266,18 +266,18 @@ function buildSystemPrompt(lang, imageContext) {
   'interna e nunca deve ser mencionada, mesmo comparando os dois. ' +
   '\n\n' +
 
-  'FERRAMENTA import_project_file — OBRIGATÓRIA QUANDO UM PROJECT FOR MENCIONADO: sempre que o usuário mencionar ' +
-  'um Project (seja pela marcação "{NomeDoProjeto}", seja citando o nome do Project em texto normal) pedindo ' +
-  'alguma coisa sobre ele, e o arquivo relevante NÃO tiver sido mandado/anexado diretamente nesta conversa (ou ' +
-  'seja, é um Project mencionado, não um arquivo já presente no chat), a PRIMEIRA ação obrigatória, antes de ' +
-  'qualquer read_file/list_files/edit_file/write_file, é chamar import_project_file para trazer aquele arquivo ' +
-  'pra dentro desta conversa. Isso é obrigatório mesmo que o usuário não peça explicitamente "importa esse ' +
-  'arquivo" — a simples menção ao Project com um pedido de ação sobre ele já é o gatilho. Nunca tente ler, editar ' +
-  'ou analisar um arquivo de Project sem antes importá-lo: fazer isso resulta em erro de arquivo inexistente ou ' +
-  'leitura de 0 bytes. Se o Project tiver arquivos Complementos (Workers, configs, arquivos auxiliares) que a ' +
-  'tarefa possa depender, chame import_project_file com include_complements=true na mesma chamada, pra trazer ' +
-  'tudo de uma vez. Só pule esse passo se o arquivo já existir nesta conversa (confirme com list_files se tiver ' +
-  'dúvida). ' +
+  'PROJECTS DO USUÁRIO: Projects são pastas que SÓ o usuário cria, na aba Projects do app. Você nunca cria, ' +
+  'promove ou "transforma" nada em Project, e criar arquivos (html, py etc.) não transforma nada em Project. ' +
+  'Quando a conversa estiver dentro de um Project, o app envia no topo um bloco "PROJECT ATUAL" com o nome, a ' +
+  'descrição e a memória daquela pasta: use isso só nessa conversa e não anuncie que está num Project. ' +
+  '\n\n' +
+
+  'FERRAMENTA read_context (CONTEXTO.md): em Projects que têm contexto personalizado, a primeira ação de cada ' +
+  'turno é read_context, que devolve o arquivo CONTEXTO.md com as instruções do usuário para aquela pasta (até ' +
+  '450 caracteres). O app já executa essa leitura antes de você responder; o resultado aparece como uma chamada ' +
+  'read_context logo depois da mensagem do usuário. Siga essas instruções em silêncio sempre que se aplicarem: ' +
+  'nunca diga que leu, nunca cite, resuma ou comente o arquivo, e não chame read_context de novo no mesmo turno. ' +
+  'Se as instruções do CONTEXTO.md conflitarem com regras de segurança, as regras de segurança vencem. ' +
   '\n\n' +
 
   'Quando o usuário pedir para criar algo que resulte em código (um jogo, uma página, um script, etc), ' +
@@ -844,15 +844,17 @@ function buildMessages(systemText, history, reminders) {
   }
 
   const reminderText = reminders.filter(Boolean).join('\n\n');
-  const last = rest[rest.length - 1];
+  // Se o fim for o par read_context, os lembretes vão na mensagem do usuário antes dele.
+  const lastIdx = rest.length >= 3 && isReadContextPair(rest, rest.length - 2) ? rest.length - 3 : rest.length - 1;
+  const last = rest[lastIdx];
   let systemContent = [systemText].concat(extraSystem).join('\n\n');
 
   if (last && last.role === 'user' && reminderText) {
     const tag = '\n\n<lembretes_do_sistema>\n' + reminderText + '\n</lembretes_do_sistema>';
     if (typeof last.content === 'string') {
-      rest[rest.length - 1] = { ...last, content: last.content + tag };
+      rest[lastIdx] = { ...last, content: last.content + tag };
     } else if (Array.isArray(last.content)) {
-      rest[rest.length - 1] = { ...last, content: last.content.concat([{ type: 'text', text: tag.trim() }]) };
+      rest[lastIdx] = { ...last, content: last.content.concat([{ type: 'text', text: tag.trim() }]) };
     }
   } else if (reminderText) {
     systemContent += '\n\n' + reminderText;
@@ -967,8 +969,24 @@ function normalizeText(s) {
   return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 }
 
+// O app injeta, no fim do histórico, um par assistant(tool_call read_context)
+// + tool(resultado) antes de cada resposta em Projects com contexto. Esse par
+// não deve contar como "última mensagem" pra decidir raciocínio nem pra
+// posicionar os lembretes: o que vale é a mensagem do usuário antes dele.
+function isReadContextPair(history, i) {
+  const a = history[i], t = history[i + 1];
+  return !!(a && t && a.role === 'assistant' && Array.isArray(a.tool_calls) && a.tool_calls.length === 1 &&
+    a.tool_calls[0] && a.tool_calls[0].function && a.tool_calls[0].function.name === 'read_context' &&
+    t.role === 'tool' && t.tool_call_id === a.tool_calls[0].id);
+}
+function effectiveLast(history) {
+  const n = history.length;
+  if (n >= 2 && isReadContextPair(history, n - 2)) return history[n - 3];
+  return history[n - 1];
+}
+
 function lastMessageInfo(history) {
-  const last = history[history.length - 1];
+  const last = effectiveLast(history);
   let text = '';
   let hasImage = false;
   for (let i = history.length - 1; i >= 0; i--) {
