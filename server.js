@@ -1843,11 +1843,17 @@ const CONTATOS_RESUMO_PROMPT =
 // Usa o mesmo worker de pesquisa do app. Roda escondida no servidor: não aparece
 // no chat e não pede autorização. Nenhuma outra ferramenta é oferecida aqui.
 const SEARCH_WORKER = (process.env.SEARCH_WORKER_URL || 'https://search.souootaviano.workers.dev').replace(/\/+$/, '');
+const APP_ORIGIN = (process.env.APP_ORIGIN || 'https://tatoia.vercel.app').replace(/\/+$/, '');
+const BROWSER_UA = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36 TatoIA/1.0';
+
 async function fetchJsonT(url, options, ms) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), ms || 15000);
   try {
-    const r = await fetch(url, { ...(options || {}), signal: ctl.signal });
+    const opts = { ...(options || {}) };
+    opts.headers = { 'User-Agent': BROWSER_UA, 'Origin': APP_ORIGIN, 'Referer': APP_ORIGIN + '/', 'Accept': 'application/json', ...(opts.headers || {}) };
+    const r = await fetch(url, { ...opts, signal: ctl.signal });
+    if (!r.ok) console.warn('[contatos-tato] pesquisa HTTP', r.status, url);
     const txt = await r.text().catch(() => '');
     let data = {}; try { data = txt ? JSON.parse(txt) : {}; } catch (e) { data = {}; }
     return { ok: r.ok, status: r.status, data };
@@ -1891,12 +1897,18 @@ async function contatosSearchPlan(ask, recent) {
   return null;
 }
 
-async function contatosTatoAnswer(system, user, ask, recent) {
+async function contatosTatoAnswer(system, user, ask, recent, clientSearch) {
+  const cs = clientSearch && typeof clientSearch === 'object' ? clientSearch : null;
+  const csText = cs && typeof cs.text === 'string' ? cs.text.slice(0, 9000) : '';
+  let query = await contatosSearchPlan(ask, recent);
+  if (!query && cs && cs.query) query = String(cs.query).slice(0, 200);
   let results = '';
-  const query = await contatosSearchPlan(ask, recent);
   if (query) {
     console.log('[contatos-tato] pesquisa:', query.slice(0, 80));
     results = await contatosWebSearch(query);
+    const failed = !results || /^A pesquisa por /.test(results) || /^Erro/.test(results);
+    if (failed && csText) { console.log('[contatos-tato] usando a pesquisa do app'); results = csText; }
+    else if (failed) results = 'Nenhum resultado encontrado agora.';
   }
   const content = user + (query
     ? '\n\nRESULTADOS DA PESQUISA (feita agora por você para "' + query + '"):\n' + results.slice(0, 9000)
@@ -1919,7 +1931,7 @@ app.post('/contatos-tato', async function (req, res) {
       (m.kind === 'tato' ? 'Tato (IA)' : nm(m.sender)) + ': ' + String(m.body || '').slice(0, 600));
     const user = 'Últimas ' + lines.length + ' mensagens:\n' + lines.join('\n') +
       '\n\nQuem te chamou agora: ' + nm(ctx.asker) + '. Mensagem: ' + String(ctx.ask || '').slice(0, 1200);
-    const out = await contatosTatoAnswer(CONTATOS_TATO_PROMPT, user, String(ctx.ask || ''), lines.slice(-6).join('\n'));
+    const out = await contatosTatoAnswer(CONTATOS_TATO_PROMPT, user, String(ctx.ask || ''), lines.slice(-6).join('\n'), req.body && req.body.client_search);
     if (!out) throw new Error('resposta vazia');
     const row = await sbRpc('tv_tato_reply', { p_msg: id, p_body: out.slice(0, 4000) });
     return res.json({ ok: true, msg: row });
@@ -1994,7 +2006,7 @@ app.post('/skill-fetch', async function (req, res) {
   try {
     const addrs = await lookup(host, { all: true });
     if (!addrs.length || addrs.some(a => isPrivateIp(a.address))) return res.status(403).json({ ok: false, error: 'Endereço não permitido.' });
-  } catch (e) { return res.status(502).json({ ok: false, error: 'Domínio não encontrado: ' + host }); }
+  } catch (e) { console.error('[skill-fetch] dns', host, e && e.code); return res.status(502).json({ ok: false, error: 'Domínio não encontrado: ' + host + ' (' + (e && e.code) + ')' }); }
   const headers = {};
   if (b.headers && typeof b.headers === 'object') {
     for (const [k, v] of Object.entries(b.headers).slice(0, 20)) {
@@ -2010,6 +2022,8 @@ app.post('/skill-fetch', async function (req, res) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 15000);
   try {
+    if (!Object.keys(headers).some(k => /^user-agent$/i.test(k))) headers['User-Agent'] = BROWSER_UA;
+    if (!Object.keys(headers).some(k => /^accept$/i.test(k))) headers['Accept'] = 'application/json, text/plain, */*';
     const r = await fetch(target.href, { method, headers, body, redirect: 'manual', signal: ctl.signal });
     if (r.status >= 300 && r.status < 400) return res.json({ ok: true, status: r.status, body: 'Redirecionamento bloqueado para ' + (r.headers.get('location') || '?') });
     const reader = r.body ? r.body.getReader() : null;
@@ -2026,8 +2040,35 @@ app.post('/skill-fetch', async function (req, res) {
     const text = Buffer.concat(chunks.map(c => Buffer.from(c))).toString('utf8');
     return res.json({ ok: true, status: r.status, content_type: r.headers.get('content-type') || '', body: text.slice(0, 60000), truncated: cut || text.length > 60000 });
   } catch (e) {
-    return res.status(502).json({ ok: false, error: e && e.name === 'AbortError' ? 'A API demorou mais de 15 segundos.' : 'Falha ao acessar a API.' });
+    console.error('[skill-fetch] falha', host, e && (e.cause && e.cause.code || e.message));
+    return res.status(502).json({ ok: false, error: e && e.name === 'AbortError' ? 'A API demorou mais de 15 segundos.' : 'Falha ao acessar a API (' + (e && (e.cause && e.cause.code || e.message) || 'erro') + ').' });
   } finally { clearTimeout(t); }
+});
+
+
+// Diagnóstico: abra https://SEU-SERVIDOR/diag no navegador para ver o que falha.
+app.get('/diag', async function (req, res) {
+  const out = { time: new Date().toISOString(), env: {
+    NVIDIA_API_KEY: !!process.env.NVIDIA_API_KEY, SUPABASE_URL: !!SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: !!SUPABASE_SERVICE_ROLE_KEY } };
+  async function probe(name, url, opts) {
+    const t0 = Date.now();
+    try {
+      const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 12000);
+      const r = await fetch(url, { ...(opts || {}), signal: ctl.signal }); clearTimeout(tm);
+      const txt = await r.text();
+      out[name] = { status: r.status, ms: Date.now() - t0, sample: txt.slice(0, 160) };
+    } catch (e) { out[name] = { error: e && (e.cause && e.cause.code || e.message), ms: Date.now() - t0 }; }
+  }
+  const h = { 'User-Agent': BROWSER_UA, 'Origin': APP_ORIGIN, 'Content-Type': 'application/json' };
+  await Promise.all([
+    probe('pesquisa_com_origin', SEARCH_WORKER + '/search', { method: 'POST', headers: h, body: JSON.stringify({ q: 'cotação dólar hoje', max: 3 }) }),
+    probe('pesquisa_sem_origin', SEARCH_WORKER + '/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ q: 'cotação dólar hoje', max: 3 }) }),
+    probe('open_meteo', 'https://geocoding-api.open-meteo.com/v1/search?name=Recife&count=1', { headers: { 'User-Agent': BROWSER_UA } }),
+    probe('frankfurter', 'https://api.frankfurter.app/latest?from=USD&to=BRL', { headers: { 'User-Agent': BROWSER_UA } })
+  ]);
+  try { out.supabase_skills = (await sbRpc('tato_skill_domains', { p_id: '00000000-0000-0000-0000-000000000000' })) === null ? 'ok' : 'ok'; }
+  catch (e) { out.supabase_skills = 'erro: ' + e.message.slice(0, 120); }
+  res.json(out);
 });
 
 // ============================================================
