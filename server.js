@@ -9,9 +9,10 @@
 //   NVIDIA_API_KEY = ...
 //   SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY = (verificação de banners do ConTATOs)
 // API OpenAI-compatible da NVIDIA (integrate.api.nvidia.com, endpoint
-// /v1/chat/completions) usando o modelo DeepSeek-V4.1-Flash — MoE multimodal
-// (texto + imagem), contexto de até 1M tokens, tool calling e raciocínio
-// controlado por reasoning_effort ("none" | "low" | "high" | "max").
+// /v1/chat/completions) usando o modelo Step 5 Preview (StepFun) — MoE de
+// 600B (27B ativos), multimodal (texto + imagem), contexto de até 1M tokens,
+// tool calling e raciocínio controlado por reasoning_effort ("low" | "medium" | "high").
+// O raciocínio do Step 5 não desliga: o nível mínimo é "low".
 // Variáveis opcionais no Render: MODEL_ID e NVIDIA_ENDPOINT (para trocar
 // de provedor sem mexer no código).
 // ============================================================
@@ -22,8 +23,8 @@ import { lookup } from 'dns/promises';
 import net from 'net';
 
 const NVIDIA_ENDPOINT = process.env.NVIDIA_ENDPOINT || 'https://integrate.api.nvidia.com/v1/chat/completions';
-// DeepSeek-V4.1-Flash na NVIDIA. Se o ID no catálogo for outro, troque pela env MODEL_ID.
-const MODEL = process.env.MODEL_ID || 'deepseek-ai/deepseek-v4.1-flash';
+// ID oficial no NVIDIA Build: stepfun-ai/step-5-preview (env MODEL_ID troca, se precisar).
+const MODEL = process.env.MODEL_ID || 'stepfun-ai/step-5-preview';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -31,33 +32,34 @@ const FETCH_TIMEOUT_MS = 1200000; // 20 minutos (era 5 min — cortava em respos
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
 
-// Tato 4.1 agora roda sobre DeepSeek-V4.1-Flash (via NVIDIA).
-// Limite de saída: 262.144 tokens (256K) — o raciocínio conta dentro dele.
+// Tato 4.1 agora roda sobre Step 5 Preview (via NVIDIA).
+// Limite de saída no nível max: 262.144 tokens (256K) — o raciocínio conta dentro dele.
 // Se o endpoint recusar esse valor, o servidor reduz sozinho o max_tokens
 // (ver MAX_TOKENS_FALLBACK); o modelo continua o mesmo.
 const MAX_TOKENS_STANDARD = Number(process.env.MAX_TOKENS) || 262144;
-const MAX_TOKENS_FALLBACK = [131072, 65536];
+const MAX_TOKENS_FALLBACK = [131072, 65536, 32768];
 
-// ---- CONTROLE DE RACIOCÍNIO (DeepSeek-V4.1-Flash) ----
-// reasoning_effort do modelo: "none" (desliga) | "low" | "high" | "max".
+// ---- CONTROLE DE RACIOCÍNIO (Step 5 Preview) ----
+// reasoning_effort do modelo: "low" | "medium" | "high" (não existe desligado).
 // Os 4 níveis do Tato (o teto de pensamento é aplicado pelo servidor: estourou
-// sem começar a responder → corta e refaz direto, com o raciocínio desligado):
-//   none   (oi, conversa curta)               → "none" (sem pensar)
-//   low    (rápido, pouca inteligência)        → "low",  teto 10K tokens
-//   medium (pensamento um pouco complexo)      → "high", teto 20K tokens
-//   max    (projetos grandes, arquitetura...)  → "max",  teto 70K tokens
+// sem começar a responder → corta e refaz em "low", levando o raciocínio já feito):
+//   none   (oi, conversa curta)               → "low",    teto  2K tokens
+//   low    (rápido, pouca inteligência)        → "low",    teto 10K tokens
+//   medium (pensamento um pouco complexo)      → "medium", teto 20K tokens
+//   max    (projetos grandes, arquitetura...)  → "high",   teto 70K tokens
+// maxOut: limite de saída por nível (pedir 256K num "oi" piora a fila).
 // Variável opcional no Render: THINKING_MODE = auto (padrão) | none | low | medium | max
 const THINKING_MODE = String(process.env.THINKING_MODE || 'auto').toLowerCase();
 const THINK_LEVELS = {
-  none:   { effort: 'none', budget: 0 },
-  low:    { effort: 'low',  budget: Number(process.env.THINK_BUDGET_LOW_TOKENS)    || 10000 },
-  medium: { effort: 'high', budget: Number(process.env.THINK_BUDGET_MEDIUM_TOKENS) || 20000 },
-  max:    { effort: 'max',  budget: Number(process.env.THINK_BUDGET_MAX_TOKENS)    || 70000 }
+  none:   { effort: 'low',    budget: Number(process.env.THINK_BUDGET_NONE_TOKENS)   || 2000,  maxOut: 8192 },
+  low:    { effort: 'low',    budget: Number(process.env.THINK_BUDGET_LOW_TOKENS)    || 10000, maxOut: 32768 },
+  medium: { effort: 'medium', budget: Number(process.env.THINK_BUDGET_MEDIUM_TOKENS) || 20000, maxOut: 65536 },
+  max:    { effort: 'high',   budget: Number(process.env.THINK_BUDGET_MAX_TOKENS)    || 70000, maxOut: 0 }
 };
 // Estimativa: ~4 caracteres por token.
 const CHARS_PER_TOKEN = 4;
 
-// Amostragem usada nos testes oficiais do DeepSeek-V4.1-Flash.
+// Amostragem recomendada pela StepFun para o Step 5 Preview.
 const TEMPERATURE = 1.0;
 const TOP_P = 0.95;
 
@@ -605,10 +607,10 @@ function trimToSafeBoundary(text) {
 
 
 // ============================================================
-// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE) — DeepSeek-V4.1-Flash
+// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE) — Step 5 Preview
 // ============================================================
 
-// O DeepSeek-V4.1-Flash aceita partes "image_url" no formato OpenAI:
+// O Step 5 Preview aceita partes "image_url" no formato OpenAI:
 //   { type: 'image_url', image_url: { url: 'https://...' } }
 //   { type: 'image_url', image_url: { url: 'data:image/png;base64,...' } }
 // Aceitamos PNG, JPEG e WebP em data URL (Base64) ou link http(s).
@@ -832,7 +834,7 @@ function isBuildRequest(history) {
 
 
 // ============================================================
-// MONTAGEM DAS MENSAGENS PRO NEMOTRON
+// MONTAGEM DAS MENSAGENS PRO MODELO
 // ============================================================
 
 // O chat template de vários modelos abertos só aceita mensagem
@@ -1020,7 +1022,7 @@ const SMALLTALK_RE = /^(oi+|ola|opa|eai|e ai|salve|bom dia|boa tarde|boa noite|t
 
 // Decide o nível de raciocínio desta resposta: none | low | medium | max.
 function decideThinking(history, builderMode) {
-  function pick(level) { const L = THINK_LEVELS[level]; return { level, effort: L.effort, budgetTokens: L.budget }; }
+  function pick(level) { const L = THINK_LEVELS[level]; return { level, effort: L.effort, budgetTokens: L.budget, maxOut: L.maxOut }; }
   if (THINK_LEVELS[THINKING_MODE]) return pick(THINKING_MODE);
   const info = lastMessageInfo(history);
   const t = normalizeText(info.text).trim();
@@ -1032,9 +1034,9 @@ function decideThinking(history, builderMode) {
   return pick('low');
 }
 
-// Parâmetro de raciocínio do DeepSeek-V4.1-Flash (vai no topo do corpo da requisição).
+// Parâmetro de raciocínio do Step 5 Preview (vai no topo do corpo da requisição).
 function reasoningParams(effort) {
-  return { reasoning_effort: effort || 'low' };
+  return { reasoning_effort: effort && effort !== 'none' ? effort : 'low' };
 }
 
 function buildThinkingReminder(lang) {
@@ -1122,7 +1124,8 @@ app.post('/', async function (req, res) {
   if (builderMode) console.log('[Tato 4.1] Modo Construtor ATIVO nesta resposta');
 
   const thinkDecision = decideThinking(history, builderMode);
-  const reasoningEnabled = thinkDecision.effort !== 'none';
+  // O Step 5 sempre pensa: o teto vale para todos os níveis.
+  const reasoningEnabled = true;
   const thinkBudgetTokens = thinkDecision.budgetTokens;
   let thinkingCutDone = false;
   console.log('[Tato 4.1] raciocínio:', thinkDecision.level, '| reasoning_effort:', thinkDecision.effort, '| teto:', thinkBudgetTokens, 'tokens');
@@ -1157,10 +1160,10 @@ app.post('/', async function (req, res) {
     // Limite máximo de saída: 320K tokens (com fallback automático se o
     // endpoint recusar). O corpo JSON aceita até 35 MB para mensagens
     // multimodais com imagens Base64 e histórico textual.
-    max_tokens: MAX_TOKENS_STANDARD,
+    max_tokens: thinkDecision.maxOut || MAX_TOKENS_STANDARD,
     temperature: TEMPERATURE,
     top_p: TOP_P,
-    // Nível de raciocínio do DeepSeek-V4.1-Flash (none | low | high | max).
+    // Nível de raciocínio do Step 5 Preview (low | medium | high).
     ...reasoningParams(thinkDecision.effort),
     stream: true
   };
@@ -1255,9 +1258,12 @@ app.post('/', async function (req, res) {
     return { fatal: true, status: lastErrStatus, text: lastErrText };
   }
 
+  const T0 = Date.now();
+  let firstTokenLogged = false;
   let upstream;
   {
     const first = await requestUpstreamWithRetry();
+    console.log('[Tato 4.1] tempo até a NVIDIA aceitar o pedido:', Date.now() - T0, 'ms | max_tokens', payload.max_tokens);
     if (first.fatal || !first.upstream) {
       return res.status(502).json({ ok: false, error: 'Server sobrecarregado, tente novamente mais tarde.' });
     }
@@ -1366,6 +1372,7 @@ app.post('/', async function (req, res) {
         if (done) break;
 
         sawAnyChunk = true;
+        if (!firstTokenLogged) { firstTokenLogged = true; console.log('[Tato 4.1] primeiro dado do modelo em', Date.now() - T0, 'ms'); }
         sseBuffer += decoder.decode(value, { stream: true });
         // SSE pode chegar com LF ou CRLF.
         sseBuffer = sseBuffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -1389,7 +1396,7 @@ app.post('/', async function (req, res) {
 
           const delta = choice.delta || {};
 
-          // O DeepSeek-V4.1-Flash (via NVIDIA) manda o raciocínio em
+          // O Step 5 Preview (via NVIDIA) manda o raciocínio em
           // reasoning_content ou reasoning; aceitamos as variantes.
           const reasoningPiece =
             (typeof delta.reasoning_content === 'string' && delta.reasoning_content) ||
@@ -1477,7 +1484,7 @@ app.post('/', async function (req, res) {
       thinkingCutDone = true;
       flushPending();
       console.warn('[Tato 4.1] Orçamento de raciocínio estourado (~' + Math.ceil(reasoningContentAcc.length / CHARS_PER_TOKEN) + ' de ' + thinkBudgetTokens + ' tokens) — refazendo sem raciocínio.');
-      payload.reasoning_effort = 'none'; // refaz sem raciocínio
+      payload.reasoning_effort = 'low'; // o Step 5 não desliga: refaz no mínimo
       // Vai como mensagem de usuário (o template do modelo só aceita
       // system no começo da conversa).
       // Leva junto o raciocínio já feito: a resposta refeita parte dele, sem pensar de novo.
@@ -1625,6 +1632,7 @@ app.post('/', async function (req, res) {
       limitReached = true;
     }
 
+    console.log('[Tato 4.1] resposta completa em', Date.now() - T0, 'ms | raciocínio ~' + Math.ceil(reasoningContentAcc.length / CHARS_PER_TOKEN) + ' tokens | nível', thinkDecision.level);
     send({
       type: 'done',
       message: {
@@ -1725,8 +1733,8 @@ async function classifyBanner(imageDataUrl) {
     max_tokens: 16384, // o raciocínio conta dentro do limite
     temperature: 0.2,
     top_p: 0.95,
-    // Raciocínio "high": olha a imagem com cuidado sem demorar demais.
-    reasoning_effort: 'high',
+    // Raciocínio "medium": olha a imagem com cuidado sem demorar demais.
+    reasoning_effort: 'medium',
     stream: false
   };
   let lastErr = null;
@@ -1802,7 +1810,7 @@ async function nvidiaText(system, user, maxTokens, opts) {
     max_tokens: Math.max(8192, maxTokens || 0),
     temperature: 0.7,
     top_p: 0.95,
-    reasoning_effort: opts.effort || 'none',
+    reasoning_effort: opts.effort || 'low',
     stream: false
   };
   // Ferramentas só quando quem chama passa explicitamente (ConTATOs: só pesquisa).
