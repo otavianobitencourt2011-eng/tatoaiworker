@@ -9,11 +9,10 @@
 //   NVIDIA_API_KEY = ...
 //   SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY = (verificação de banners do ConTATOs)
 // API OpenAI-compatible da NVIDIA (integrate.api.nvidia.com, endpoint
-// /v1/chat/completions) usando o modelo NVIDIA Nemotron 3 Ultra (550B, 55B
-// ativos) — SÓ TEXTO, tool calling e raciocínio ligável/desligável com teto
-// nativo de tokens (chat_template_kwargs.enable_thinking + reasoning_budget).
-// Imagens enviadas no chat viram um aviso em texto (o modelo não enxerga).
-// A verificação de banner dos ConTATOs usa um modelo de visão próprio (VISION_MODEL).
+// /v1/chat/completions) usando o modelo Meta Muse Glimmer 30B — denso, rápido,
+// multimodal (texto + imagem), feito para agentes (tool calling) e com raciocínio
+// ajustável por reasoning_effort (low | medium | high | xhigh).
+// Contexto TOTAL (entrada + saída) de ~131K tokens.
 // Variáveis opcionais no Render: MODEL_ID e NVIDIA_ENDPOINT (para trocar
 // de provedor sem mexer no código).
 // ============================================================
@@ -25,9 +24,9 @@ import net from 'net';
 
 const NVIDIA_ENDPOINT = process.env.NVIDIA_ENDPOINT || 'https://integrate.api.nvidia.com/v1/chat/completions';
 // ID oficial no NVIDIA Build (env MODEL_ID troca, se precisar).
-const MODEL = process.env.MODEL_ID || 'nvidia/nemotron-3-ultra-550b-a55b';
-// Modelo com visão usado SÓ na verificação de banners dos ConTATOs.
-const VISION_MODEL = process.env.VISION_MODEL || 'nvidia/nemotron-3.5-super-vl-120b-a12b';
+const MODEL = process.env.MODEL_ID || 'meta/muse-glimmer-30b';
+// O Muse Glimmer enxerga imagens: a verificação de banner usa o mesmo modelo.
+const VISION_MODEL = process.env.VISION_MODEL || MODEL;
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -35,34 +34,36 @@ const FETCH_TIMEOUT_MS = 1200000; // 20 minutos (era 5 min — cortava em respos
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
 
-// Tato 4.1 agora roda sobre Nemotron 3 Ultra (via NVIDIA).
-// Cada nível tem seu limite de saída (raciocínio + resposta). O exemplo oficial da
-// NVIDIA usa 16K; se o endpoint recusar um valor maior, o servidor reduz sozinho.
+// Tato 4.1 agora roda sobre Muse Glimmer 30B (via NVIDIA).
+// O contexto é de ~131K somando entrada e saída, então cada nível tem um limite de
+// saída que cabe junto com o prompt; se o endpoint recusar, o servidor reduz sozinho.
 // Se o endpoint recusar esse valor, o servidor reduz sozinho o max_tokens
 // (ver MAX_TOKENS_FALLBACK); o modelo continua o mesmo.
 const MAX_TOKENS_STANDARD = Number(process.env.MAX_TOKENS) || 262144;
-const MAX_TOKENS_FALLBACK = [65536, 32768, 16384];
+const MAX_TOKENS_FALLBACK = [65536, 32768, 16384, 8192];
 
-// ---- CONTROLE DE RACIOCÍNIO (Nemotron 3 Ultra) ----
-// enable_thinking liga/desliga e reasoning_budget é um TETO NATIVO de tokens de
-// pensamento (o modelo fecha o raciocínio no limite e responde).
-//   none   (oi, conversa curta)               → sem raciocínio
-//   low    (rápido, pouca inteligência)        → teto 10K
-//   medium (pensamento um pouco complexo)      → teto 20K
-//   max    (projetos grandes, arquitetura...)  → teto 70K
-// maxOut = raciocínio + espaço para a resposta.
+// ---- CONTROLE DE RACIOCÍNIO (Muse Glimmer 30B) ----
+// reasoning_effort: low | medium | high | xhigh. O teto de pensamento é aplicado pelo
+// servidor: estourou sem começar a responder → corta e refaz em "low", levando junto
+// o raciocínio já feito.
+//   none   (oi, conversa curta)               → "low",    teto  2K
+//   low    (rápido, pouca inteligência)        → "low",    teto 10K
+//   medium (pensamento um pouco complexo)      → "medium", teto 20K
+//   max    (projetos grandes, arquitetura...)  → "high",   teto 50K
+// O max é 50K (e não 70K) porque o contexto inteiro do modelo é ~131K: prompt +
+// histórico + pensamento + resposta precisam caber juntos.
 // Variável opcional no Render: THINKING_MODE = auto (padrão) | none | low | medium | max
 const THINKING_MODE = String(process.env.THINKING_MODE || 'auto').toLowerCase();
 const THINK_LEVELS = {
-  none:   { effort: 'off', budget: 0,                                                    maxOut: 8192 },
-  low:    { effort: 'on',  budget: Number(process.env.THINK_BUDGET_LOW_TOKENS)    || 10000, maxOut: 26384 },
-  medium: { effort: 'on',  budget: Number(process.env.THINK_BUDGET_MEDIUM_TOKENS) || 20000, maxOut: 52768 },
-  max:    { effort: 'on',  budget: Number(process.env.THINK_BUDGET_MAX_TOKENS)    || 70000, maxOut: 135536 }
+  none:   { effort: 'low',    budget: Number(process.env.THINK_BUDGET_NONE_TOKENS)   || 2000,  maxOut: 8192 },
+  low:    { effort: 'low',    budget: Number(process.env.THINK_BUDGET_LOW_TOKENS)    || 10000, maxOut: 24576 },
+  medium: { effort: 'medium', budget: Number(process.env.THINK_BUDGET_MEDIUM_TOKENS) || 20000, maxOut: 40960 },
+  max:    { effort: 'high',   budget: Number(process.env.THINK_BUDGET_MAX_TOKENS)    || 50000, maxOut: 81920 }
 };
 // Estimativa: ~4 caracteres por token.
 const CHARS_PER_TOKEN = 4;
 
-// Amostragem do exemplo oficial do Nemotron 3 Ultra.
+// Amostragem do exemplo oficial do Muse Glimmer na NVIDIA.
 const TEMPERATURE = 1.0;
 const TOP_P = 0.95;
 
@@ -547,7 +548,7 @@ function trimToSafeBoundary(text) {
 
 
 // ============================================================
-// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE) — Nemotron
+// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE) — Muse Glimmer
 // ============================================================
 
 // Os modelos com visão aceitam partes "image_url" no formato OpenAI:
@@ -703,19 +704,6 @@ function attachSeparateImages(history, rawImages) {
 // Limita as imagens por requisição (MAX_IMAGES_PER_REQUEST).
 // Mantém as mais RECENTES e troca as antigas por um aviso em texto, pra
 // conversa continuar fazendo sentido.
-// O Nemotron 3 Ultra é só texto: troca as imagens por um aviso para o modelo.
-function stripImagesForTextModel(history) {
-  for (const m of history) {
-    if (!m || !Array.isArray(m.content)) continue;
-    const n = m.content.filter(p => p && p.type === 'image_url').length;
-    if (!n) continue;
-    const text = m.content.filter(p => p && p.type === 'text').map(p => p.text).join('\n');
-    m.content = (text ? text + '\n\n' : '') + '[O usuário anexou ' + n + ' imagem(ns), mas este modelo não consegue ver imagens. ' +
-      'Diga isso com naturalidade se a resposta depender da imagem e peça uma descrição em texto.]';
-  }
-  return history;
-}
-
 function limitHistoryImages(history) {
   let total = 0;
   for (const message of history) {
@@ -989,13 +977,9 @@ function decideThinking(history, builderMode) {
   return pick('low');
 }
 
-// Parâmetros de raciocínio do Nemotron 3 Ultra. Com ferramentas, a NVIDIA pede
-// force_nonempty_content para separar raciocínio e tool calls corretamente.
-function reasoningParams(decision, hasTools) {
-  if (!decision || decision.effort === 'off') return { chat_template_kwargs: { enable_thinking: false } };
-  const kw = { enable_thinking: true };
-  if (hasTools) kw.force_nonempty_content = true;
-  return { chat_template_kwargs: kw, reasoning_budget: decision.budgetTokens };
+// Parâmetro de raciocínio do Muse Glimmer (vai no topo do corpo da requisição).
+function reasoningParams(decision) {
+  return { reasoning_effort: (decision && decision.effort) || 'low' };
 }
 
 function buildThinkingReminder(lang) {
@@ -1052,9 +1036,9 @@ app.post('/', async function (req, res) {
 
   const body = req.body;
 
-  const history = stripImagesForTextModel(limitHistoryImages(
+  const history = limitHistoryImages(
     attachSeparateImages(normalizeHistory(body && body.messages), body && body.images)
-  ));
+  );
 
   if (!history.length) {
     return res.status(400).json({ ok: false, error: 'Nenhuma mensagem enviada.' });
@@ -1083,9 +1067,9 @@ app.post('/', async function (req, res) {
   if (builderMode) console.log('[Tato 4.1] Modo Construtor ATIVO nesta resposta');
 
   const thinkDecision = decideThinking(history, builderMode);
-  const reasoningEnabled = thinkDecision.effort !== 'off';
-  // O teto nativo (reasoning_budget) já corta; o do servidor é só uma rede de segurança.
-  const thinkBudgetTokens = Math.ceil(thinkDecision.budgetTokens * 1.25);
+  // O Muse Glimmer sempre raciocina um pouco: o teto vale para todos os níveis.
+  const reasoningEnabled = true;
+  const thinkBudgetTokens = thinkDecision.budgetTokens;
   let thinkingCutDone = false;
   console.log('[Tato 4.1] raciocínio:', thinkDecision.level, '| pensamento:', thinkDecision.effort, '| teto:', thinkBudgetTokens, 'tokens');
 
@@ -1121,8 +1105,8 @@ app.post('/', async function (req, res) {
     max_tokens: thinkDecision.maxOut || MAX_TOKENS_STANDARD,
     temperature: TEMPERATURE,
     top_p: TOP_P,
-    // Raciocínio do Nemotron 3 Ultra (liga/desliga + teto nativo).
-    ...reasoningParams(thinkDecision, !!(tools && tools.length)),
+    // Nível de raciocínio do Muse Glimmer.
+    ...reasoningParams(thinkDecision),
     stream: true
   };
 
@@ -1157,7 +1141,6 @@ app.post('/', async function (req, res) {
     if (!next) return false;
     console.warn('[Tato 4.1] max_tokens', payload.max_tokens, 'recusado pela NVIDIA — tentando com', next);
     payload.max_tokens = next;
-    if (payload.reasoning_budget && payload.reasoning_budget >= next) payload.reasoning_budget = Math.max(1024, next - 4096);
     return true;
   }
 
@@ -1355,7 +1338,7 @@ app.post('/', async function (req, res) {
 
           const delta = choice.delta || {};
 
-          // O Nemotron (via NVIDIA) manda o raciocínio em
+          // O modelo (via NVIDIA) manda o raciocínio em
           // reasoning_content ou reasoning; aceitamos as variantes.
           const reasoningPiece =
             (typeof delta.reasoning_content === 'string' && delta.reasoning_content) ||
@@ -1443,8 +1426,7 @@ app.post('/', async function (req, res) {
       thinkingCutDone = true;
       flushPending();
       console.warn('[Tato 4.1] Orçamento de raciocínio estourado (~' + Math.ceil(reasoningContentAcc.length / CHARS_PER_TOKEN) + ' de ' + thinkBudgetTokens + ' tokens) — refazendo sem raciocínio.');
-      payload.chat_template_kwargs = { enable_thinking: false }; // refaz sem raciocínio
-      delete payload.reasoning_budget;
+      payload.reasoning_effort = 'low'; // refaz no mínimo
       // Vai como mensagem de usuário (o template do modelo só aceita
       // system no começo da conversa).
       // Leva junto o raciocínio já feito: a resposta refeita parte dele, sem pensar de novo.
@@ -1693,8 +1675,8 @@ async function classifyBanner(imageDataUrl) {
     max_tokens: 16384, // o raciocínio conta dentro do limite
     temperature: 0.2,
     top_p: 0.95,
-    // Raciocínio em esforço médio no modelo de visão.
-    chat_template_kwargs: { enable_thinking: true, medium_effort: true },
+    // Raciocínio médio: olha a imagem com cuidado sem demorar demais.
+    reasoning_effort: 'medium',
     stream: false
   };
   let lastErr = null;
@@ -1770,7 +1752,7 @@ async function nvidiaText(system, user, maxTokens, opts) {
     max_tokens: Math.max(8192, maxTokens || 0),
     temperature: 0.7,
     top_p: 0.95,
-    chat_template_kwargs: { enable_thinking: false },
+    reasoning_effort: 'low',
     stream: false
   };
   // Ferramentas só quando quem chama passa explicitamente (ConTATOs: só pesquisa).
