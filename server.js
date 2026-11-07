@@ -1980,4 +1980,71 @@ app.post('/skill-fetch', async function (req, res) {
   let target;
   try { target = new URL(String(b.url || '')); } catch (e) { return res.status(400).json({ ok: false, error: 'URL inválida' }); }
   if (target.protocol !== 'https:') return res.status(400).json({ ok: false, error: 'Só URLs https:// são permitidas.' });
-  if (target.username || target.password || (target.p
+  if (target.username || target.password || (target.port && target.port !== '443')) return res.status(400).json({ ok: false, error: 'URL não permitida.' });
+  const method = String(b.method || 'GET').toUpperCase();
+  if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) return res.status(400).json({ ok: false, error: 'Método não permitido.' });
+  let domains;
+  try { domains = await sbRpc('tato_skill_domains', { p_id: id }); } catch (e) {
+    console.error('[skill-fetch]', e && e.message); return res.status(500).json({ ok: false, error: 'Não consegui ler a skill.' });
+  }
+  const host = target.hostname.toLowerCase();
+  if (!Array.isArray(domains) || !domains.some(d => host === d || host.endsWith('.' + d))) {
+    return res.status(403).json({ ok: false, error: 'Esta skill não tem permissão para acessar ' + host + '.' });
+  }
+  try {
+    const addrs = await lookup(host, { all: true });
+    if (!addrs.length || addrs.some(a => isPrivateIp(a.address))) return res.status(403).json({ ok: false, error: 'Endereço não permitido.' });
+  } catch (e) { return res.status(502).json({ ok: false, error: 'Domínio não encontrado: ' + host }); }
+  const headers = {};
+  if (b.headers && typeof b.headers === 'object') {
+    for (const [k, v] of Object.entries(b.headers).slice(0, 20)) {
+      if (!SKILL_BLOCKED_HEADERS.test(k) && /^[A-Za-z0-9-]{1,60}$/.test(k)) headers[k] = String(v).slice(0, 2000);
+    }
+  }
+  let body;
+  if (b.body != null && method !== 'GET') {
+    body = typeof b.body === 'string' ? b.body : JSON.stringify(b.body);
+    if (body.length > 100000) return res.status(400).json({ ok: false, error: 'Corpo grande demais.' });
+    if (!Object.keys(headers).some(k => /^content-type$/i.test(k))) headers['Content-Type'] = 'application/json';
+  }
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 15000);
+  try {
+    const r = await fetch(target.href, { method, headers, body, redirect: 'manual', signal: ctl.signal });
+    if (r.status >= 300 && r.status < 400) return res.json({ ok: true, status: r.status, body: 'Redirecionamento bloqueado para ' + (r.headers.get('location') || '?') });
+    const reader = r.body ? r.body.getReader() : null;
+    const chunks = []; let size = 0, cut = false;
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > 300000) { cut = true; try { reader.cancel(); } catch (e) {} break; }
+        chunks.push(value);
+      }
+    }
+    const text = Buffer.concat(chunks.map(c => Buffer.from(c))).toString('utf8');
+    return res.json({ ok: true, status: r.status, content_type: r.headers.get('content-type') || '', body: text.slice(0, 60000), truncated: cut || text.length > 60000 });
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: e && e.name === 'AbortError' ? 'A API demorou mais de 15 segundos.' : 'Falha ao acessar a API.' });
+  } finally { clearTimeout(t); }
+});
+
+// ============================================================
+// START
+// ============================================================
+
+const PORT = Number(process.env.PORT) || 10000;
+const HOST = '0.0.0.0';
+
+// Render fica na frente do Node com um proxy HTTP.
+// Mantemos conexões longas para o streaming SSE da IA.
+const httpServer = app.listen(PORT, HOST, function () {
+  console.log('Tato server rodando em http://' + HOST + ':' + PORT + ' — modelo ' + MODEL);
+});
+
+// Evita que o próprio Node encerre conexões longas antes do streaming terminar.
+httpServer.keepAliveTimeout = 120000;
+httpServer.headersTimeout = 125000;
+httpServer.requestTimeout = 0;
+httpServer.timeout = 0;
