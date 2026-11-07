@@ -9,9 +9,12 @@
 //   NVIDIA_API_KEY = ...
 //   SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY = (verificação de banners do ConTATOs)
 // API OpenAI-compatible da NVIDIA (integrate.api.nvidia.com, endpoint
-// /v1/chat/completions) usando o modelo Nemotron 3.5 Super VL
-// (nvidia/nemotron-3.5-super-vl-120b-a12b) — 120B total / 12B ativos,
-// contexto de até 1M tokens, entrada de texto + imagem.
+// /v1/chat/completions) usando o modelo GLM-5.3-Flash (Z.ai) — contexto
+// de até 1M tokens, saída máxima de 128K, entrada de texto + imagem.
+// O raciocínio do GLM-5.3-Flash fica SEMPRE ligado; o nível é controlado
+// por reasoning_effort ("low" | "high" | "max").
+// Variáveis opcionais no Render: MODEL_ID e NVIDIA_ENDPOINT (para trocar
+// de provedor sem mexer no código).
 // ============================================================
 
 import express from 'express';
@@ -19,9 +22,9 @@ import { readFileSync } from 'fs';
 import { lookup } from 'dns/promises';
 import net from 'net';
 
-const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
-// ID confirmado na NVIDIA Build: nvidia/nemotron-3.5-super-vl-120b-a12b.
-const MODEL = 'nvidia/nemotron-3.5-super-vl-120b-a12b';
+const NVIDIA_ENDPOINT = process.env.NVIDIA_ENDPOINT || 'https://integrate.api.nvidia.com/v1/chat/completions';
+// GLM-5.3-Flash na NVIDIA. Se o ID no catálogo for outro, troque pela env MODEL_ID.
+const MODEL = process.env.MODEL_ID || 'z-ai/glm-5.3-flash';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -29,33 +32,38 @@ const FETCH_TIMEOUT_MS = 1200000; // 20 minutos (era 5 min — cortava em respos
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
 
-// Tato 4.1 agora roda sobre Nemotron 3.5 Super VL (via NVIDIA).
-// Limite de saída: 320K tokens (o modelo tem janela de 1M).
-// Se o endpoint da NVIDIA recusar esse valor, o servidor tenta de novo
+// Tato 4.1 agora roda sobre GLM-5.3-Flash (via NVIDIA).
+// Limite de saída: 131.072 tokens (128K), o MÁXIMO do modelo (o raciocínio
+// conta dentro desse limite). Se o endpoint recusar, o servidor tenta de novo
 // sozinho com um limite menor (ver MAX_TOKENS_FALLBACK).
-const MAX_TOKENS_STANDARD = 320000;
-const MAX_TOKENS_FALLBACK = [131072, 65536];
+const MAX_TOKENS_STANDARD = 131072;
+const MAX_TOKENS_FALLBACK = [65536, 32768];
 
-// ---- CONTROLE DE RACIOCÍNIO ----
-// Esforço ALTO (high) do Nemotron 3.5: enable_thinking: true + medium_effort: false.
-// A decisão de ligar ou não continua adaptativa (decideThinking):
-//   - pedido simples ("oi", conversa curta) → raciocínio DESLIGADO
-//   - pedido normal (código, arquivos, projeto simples) → até 8K tokens de raciocínio
-//   - pedido complexo (arquitetura, debug, refatoração...) → até 50K tokens de raciocínio
-// Estourou o orçamento sem começar a responder → corta e refaz sem pensar.
-// Variável opcional no Render: THINKING_MODE = auto (padrão) | on | off
+// ---- CONTROLE DE RACIOCÍNIO (GLM-5.3-Flash) ----
+// O modelo não desliga o raciocínio e só aceita reasoning_effort low | high | max.
+// Os 4 níveis do Tato são mapeados assim (o teto de pensamento é aplicado pelo
+// servidor: estourou sem começar a responder → corta e refaz direto, em "low"):
+//   none   (oi, conversa curta)               → effort "low",  teto  2K tokens
+//   low    (rápido, pouca inteligência)        → effort "low",  teto 10K tokens
+//   medium (pensamento um pouco complexo)      → effort "high", teto 20K tokens
+//   max    (projetos grandes, arquitetura...)  → effort "max",  teto 70K tokens
+// Variável opcional no Render: THINKING_MODE = auto (padrão) | none | low | medium | max
 const THINKING_MODE = String(process.env.THINKING_MODE || 'auto').toLowerCase();
-const THINK_BUDGET_NORMAL_TOKENS = Number(process.env.THINK_BUDGET_NORMAL_TOKENS) || 8000;
-const THINK_BUDGET_COMPLEX_TOKENS = Number(process.env.THINK_BUDGET_COMPLEX_TOKENS) || 50000;
+const THINK_LEVELS = {
+  none:   { effort: 'low',  budget: Number(process.env.THINK_BUDGET_NONE_TOKENS)   || 2000 },
+  low:    { effort: 'low',  budget: Number(process.env.THINK_BUDGET_LOW_TOKENS)    || 10000 },
+  medium: { effort: 'high', budget: Number(process.env.THINK_BUDGET_MEDIUM_TOKENS) || 20000 },
+  max:    { effort: 'max',  budget: Number(process.env.THINK_BUDGET_MAX_TOKENS)    || 70000 }
+};
 // Estimativa: ~4 caracteres por token.
 const CHARS_PER_TOKEN = 4;
 
-// Recomendação oficial da NVIDIA para o Nemotron 3.5 Super VL.
+// Amostragem recomendada para o GLM-5.3-Flash.
 const TEMPERATURE = 1.0;
 const TOP_P = 0.95;
 
-// Limite de imagens por requisição aceito pelo Nemotron 3.5 Super VL.
-const MAX_IMAGES_PER_REQUEST = 4;
+// Limite de imagens por requisição (conservador; ajuste com a env MAX_IMAGES).
+const MAX_IMAGES_PER_REQUEST = Number(process.env.MAX_IMAGES) || 4;
 
 // Limite único de tamanho de arquivo no backend.
 const MAX_FILE_BYTES_STANDARD = 1 * 1024 * 1024;
@@ -598,14 +606,14 @@ function trimToSafeBoundary(text) {
 
 
 // ============================================================
-// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE) — Nemotron 3.5 Super VL
+// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE) — GLM-5.3-Flash
 // ============================================================
 
-// O Nemotron 3.5 Super VL aceita partes "image_url" no formato OpenAI:
+// O GLM-5.3-Flash aceita partes "image_url" no formato OpenAI:
 //   { type: 'image_url', image_url: { url: 'https://...' } }
 //   { type: 'image_url', image_url: { url: 'data:image/png;base64,...' } }
 // Aceitamos PNG, JPEG e WebP em data URL (Base64) ou link http(s).
-// O campo "detail" (padrão da OpenAI) NÃO é enviado: o Nemotron não usa
+// O campo "detail" (padrão da OpenAI) NÃO é enviado: o modelo não usa
 // e alguns servidores recusam campos desconhecidos dentro de image_url.
 function isSupportedVisionUrl(value) {
   if (typeof value !== 'string' || !value.trim()) return false;
@@ -647,7 +655,7 @@ function normalizeVisionContent(content) {
   }
 
   // Imagens primeiro, texto depois: é a ordem dos exemplos oficiais de
-  // modelos de visão e a que o Nemotron VL entende melhor.
+  // modelos de visão (GLM-V incluso).
   const normalized = images.concat(texts);
   if (!normalized.length) return null;
   // Só texto → manda como string simples (formato mais compatível).
@@ -751,7 +759,7 @@ function attachSeparateImages(history, rawImages) {
   return history;
 }
 
-// O Nemotron 3.5 Super VL aceita no máximo 4 imagens por requisição.
+// Limita as imagens por requisição (MAX_IMAGES_PER_REQUEST).
 // Mantém as mais RECENTES e troca as antigas por um aviso em texto, pra
 // conversa continuar fazendo sentido.
 function limitHistoryImages(history) {
@@ -828,7 +836,7 @@ function isBuildRequest(history) {
 // MONTAGEM DAS MENSAGENS PRO NEMOTRON
 // ============================================================
 
-// O chat template do Nemotron (mesma família do Qwen3) só aceita mensagem
+// O chat template do GLM (como o de vários modelos abertos) só aceita mensagem
 // "system" NO INÍCIO da conversa. Mandar system no meio ou no fim pode
 // dar erro 400 ou fazer o modelo ignorar. Por isso:
 //  - todos os system (prompt principal + system que vierem no histórico)
@@ -908,7 +916,7 @@ function isExplicitGithubRequest(history) {
 // THINK FILTER
 // ============================================================
 
-// O Nemotron pode devolver o raciocínio em reasoning_content/reasoning
+// O GLM devolve o raciocínio em reasoning_content/reasoning
 // (separado) ou embutido no content entre <think>...</think>. Este filtro
 // cobre o segundo caso.
 function makeThinkFilter() {
@@ -1011,27 +1019,23 @@ const WORK_RE = /(codigo|code|bug|erro|error|arquivo|file|html|css|script|funcao
 // Mensagens curtinhas de conversa: nunca ativam raciocínio.
 const SMALLTALK_RE = /^(oi+|ola|opa|eai|e ai|salve|bom dia|boa tarde|boa noite|tudo bem|td bem|beleza|blz|valeu|vlw|obrigad[oa]|brigad[oa]|ok|okay|certo|show|top|kkk+|haha+|hello|hi|hey|thanks|thank you|tchau)[\s!?.,]*$/;
 
-// Decide se o Nemotron pensa nesta resposta e com qual orçamento (em TOKENS):
-//   simples/conversa → desligado | normal → 8K | complexo → 50K
-function decideThinking(history) {
-  if (THINKING_MODE === 'off') return { enabled: false, budgetTokens: 0, level: 'off' };
-  if (THINKING_MODE === 'on') return { enabled: true, budgetTokens: THINK_BUDGET_COMPLEX_TOKENS, level: 'on' };
+// Decide o nível de raciocínio desta resposta: none | low | medium | max.
+function decideThinking(history, builderMode) {
+  function pick(level) { const L = THINK_LEVELS[level]; return { level, effort: L.effort, budgetTokens: L.budget }; }
+  if (THINK_LEVELS[THINKING_MODE]) return pick(THINKING_MODE);
   const info = lastMessageInfo(history);
   const t = normalizeText(info.text).trim();
-  if (info.lastRole === 'tool') return { enabled: true, budgetTokens: THINK_BUDGET_NORMAL_TOKENS, level: 'normal' };
-  if (!info.hasImage && (SMALLTALK_RE.test(t) || (t.length < 25 && !WORK_RE.test(t)))) {
-    return { enabled: false, budgetTokens: 0, level: 'simple' };
-  }
-  if (COMPLEX_RE.test(t) || t.length > 1500) return { enabled: true, budgetTokens: THINK_BUDGET_COMPLEX_TOKENS, level: 'complex' };
-  if (info.hasImage || WORK_RE.test(t) || t.length > 240) return { enabled: true, budgetTokens: THINK_BUDGET_NORMAL_TOKENS, level: 'normal' };
-  return { enabled: false, budgetTokens: 0, level: 'simple' };
+  // Continuação depois de ferramenta: projeto grande segue em max; o resto em medium.
+  if (info.lastRole === 'tool') return pick(builderMode || COMPLEX_RE.test(t) ? 'max' : 'medium');
+  if (!info.hasImage && (SMALLTALK_RE.test(t) || (t.length < 25 && !WORK_RE.test(t)))) return pick('none');
+  if (builderMode || COMPLEX_RE.test(t) || t.length > 1500) return pick('max');
+  if (info.hasImage || WORK_RE.test(t) || t.length > 240) return pick('medium');
+  return pick('low');
 }
 
-// Esforço ALTO do Nemotron 3.5: enable_thinking true + medium_effort false.
-function thinkingKwargs(enabled) {
-  return enabled
-    ? { enable_thinking: true, medium_effort: false }
-    : { enable_thinking: false };
+// Parâmetro de raciocínio do GLM-5.3-Flash (vai no topo do corpo da requisição).
+function reasoningParams(effort) {
+  return { reasoning_effort: effort || 'low' };
 }
 
 function buildThinkingReminder(lang) {
@@ -1112,17 +1116,18 @@ app.post('/', async function (req, res) {
 
   // Este worker é o backend do Tato 4.1.
   const modelMode = 'tato-4.1';
-  const thinkDecision = decideThinking(history);
-  const reasoningEnabled = thinkDecision.enabled;
-  const thinkBudgetTokens = thinkDecision.enabled ? thinkDecision.budgetTokens : 0;
-  let thinkingCutDone = false;
-  console.log('[Tato 4.1] raciocínio:', thinkDecision.level, '| esforço:', reasoningEnabled ? 'alto' : 'desligado', '| orçamento:', thinkBudgetTokens, 'tokens');
-
   const imageContext = normalizeImageContext(body, tools);
 
   // Modo Construtor: só carrega o prompt grande quando o pedido é de construção.
   const builderMode = !!BUILDER_PROMPT && isBuildRequest(history);
   if (builderMode) console.log('[Tato 4.1] Modo Construtor ATIVO nesta resposta');
+
+  const thinkDecision = decideThinking(history, builderMode);
+  // O GLM sempre pensa: o orçamento vale para todos os níveis.
+  const reasoningEnabled = true;
+  const thinkBudgetTokens = thinkDecision.budgetTokens;
+  let thinkingCutDone = false;
+  console.log('[Tato 4.1] raciocínio:', thinkDecision.level, '| reasoning_effort:', thinkDecision.effort, '| teto:', thinkBudgetTokens, 'tokens');
 
   const reminders = [
     FILE_REMINDER,
@@ -1157,8 +1162,8 @@ app.post('/', async function (req, res) {
     max_tokens: MAX_TOKENS_STANDARD,
     temperature: TEMPERATURE,
     top_p: TOP_P,
-    // Esforço ALTO quando ligado: enable_thinking true + medium_effort false.
-    chat_template_kwargs: thinkingKwargs(reasoningEnabled),
+    // Nível de raciocínio do GLM-5.3-Flash (low | high | max).
+    ...reasoningParams(thinkDecision.effort),
     stream: true
   };
 
@@ -1386,7 +1391,7 @@ app.post('/', async function (req, res) {
 
           const delta = choice.delta || {};
 
-          // O Nemotron (via NVIDIA/vLLM) manda o raciocínio em
+          // O GLM-5.3-Flash (via NVIDIA/vLLM) manda o raciocínio em
           // reasoning_content ou reasoning; aceitamos as variantes.
           const reasoningPiece =
             (typeof delta.reasoning_content === 'string' && delta.reasoning_content) ||
@@ -1474,8 +1479,8 @@ app.post('/', async function (req, res) {
       thinkingCutDone = true;
       flushPending();
       console.warn('[Tato 4.1] Orçamento de raciocínio estourado (~' + Math.ceil(reasoningContentAcc.length / CHARS_PER_TOKEN) + ' de ' + thinkBudgetTokens + ' tokens) — refazendo sem raciocínio.');
-      payload.chat_template_kwargs = thinkingKwargs(false);
-      // Vai como mensagem de usuário (o template do Nemotron só aceita
+      payload.reasoning_effort = 'low'; // o GLM não desliga o raciocínio: refaz no mínimo
+      // Vai como mensagem de usuário (o template do modelo só aceita
       // system no começo da conversa).
       payload.messages.push({
         role: 'user',
@@ -1707,12 +1712,11 @@ async function classifyBanner(imageDataUrl) {
         ]
       }
     ],
-    max_tokens: 8192,
+    max_tokens: 16384, // o raciocínio conta dentro do limite
     temperature: 0.2,
     top_p: 0.95,
-    // Raciocínio ligado em esforço médio: suficiente pra olhar a imagem
-    // com cuidado sem deixar o usuário esperando demais.
-    chat_template_kwargs: { enable_thinking: true, medium_effort: true },
+    // Raciocínio "high": olha a imagem com cuidado sem demorar demais.
+    reasoning_effort: 'high',
     stream: false
   };
   let lastErr = null;
@@ -1784,10 +1788,11 @@ async function nvidiaText(system, user, maxTokens, opts) {
   const body = {
     model: MODEL,
     messages: opts.messages || [{ role: 'system', content: system }, { role: 'user', content: user }],
-    max_tokens: maxTokens || 2048,
+    // O GLM sempre pensa e o raciocínio conta no limite: garante folga.
+    max_tokens: Math.max(8192, maxTokens || 0),
     temperature: 0.7,
     top_p: 0.95,
-    chat_template_kwargs: { enable_thinking: false },
+    reasoning_effort: opts.effort || 'low',
     stream: false
   };
   // Ferramentas só quando quem chama passa explicitamente (ConTATOs: só pesquisa).
