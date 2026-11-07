@@ -9,10 +9,11 @@
 //   NVIDIA_API_KEY = ...
 //   SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY = (verificação de banners do ConTATOs)
 // API OpenAI-compatible da NVIDIA (integrate.api.nvidia.com, endpoint
-// /v1/chat/completions) usando o modelo Step 5 Preview (StepFun) — MoE de
-// 600B (27B ativos), multimodal (texto + imagem), contexto de até 1M tokens,
-// tool calling e raciocínio controlado por reasoning_effort ("low" | "medium" | "high").
-// O raciocínio do Step 5 não desliga: o nível mínimo é "low".
+// /v1/chat/completions) usando o modelo NVIDIA Nemotron 3 Ultra (550B, 55B
+// ativos) — SÓ TEXTO, tool calling e raciocínio ligável/desligável com teto
+// nativo de tokens (chat_template_kwargs.enable_thinking + reasoning_budget).
+// Imagens enviadas no chat viram um aviso em texto (o modelo não enxerga).
+// A verificação de banner dos ConTATOs usa um modelo de visão próprio (VISION_MODEL).
 // Variáveis opcionais no Render: MODEL_ID e NVIDIA_ENDPOINT (para trocar
 // de provedor sem mexer no código).
 // ============================================================
@@ -23,8 +24,10 @@ import { lookup } from 'dns/promises';
 import net from 'net';
 
 const NVIDIA_ENDPOINT = process.env.NVIDIA_ENDPOINT || 'https://integrate.api.nvidia.com/v1/chat/completions';
-// ID oficial no NVIDIA Build: stepfun-ai/step-5-preview (env MODEL_ID troca, se precisar).
-const MODEL = process.env.MODEL_ID || 'stepfun-ai/step-5-preview';
+// ID oficial no NVIDIA Build (env MODEL_ID troca, se precisar).
+const MODEL = process.env.MODEL_ID || 'nvidia/nemotron-3-ultra-550b-a55b';
+// Modelo com visão usado SÓ na verificação de banners dos ConTATOs.
+const VISION_MODEL = process.env.VISION_MODEL || 'nvidia/nemotron-3.5-super-vl-120b-a12b';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -32,34 +35,34 @@ const FETCH_TIMEOUT_MS = 1200000; // 20 minutos (era 5 min — cortava em respos
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
 
-// Tato 4.1 agora roda sobre Step 5 Preview (via NVIDIA).
-// Limite de saída no nível max: 262.144 tokens (256K) — o raciocínio conta dentro dele.
+// Tato 4.1 agora roda sobre Nemotron 3 Ultra (via NVIDIA).
+// Cada nível tem seu limite de saída (raciocínio + resposta). O exemplo oficial da
+// NVIDIA usa 16K; se o endpoint recusar um valor maior, o servidor reduz sozinho.
 // Se o endpoint recusar esse valor, o servidor reduz sozinho o max_tokens
 // (ver MAX_TOKENS_FALLBACK); o modelo continua o mesmo.
 const MAX_TOKENS_STANDARD = Number(process.env.MAX_TOKENS) || 262144;
-const MAX_TOKENS_FALLBACK = [131072, 65536, 32768];
+const MAX_TOKENS_FALLBACK = [65536, 32768, 16384];
 
-// ---- CONTROLE DE RACIOCÍNIO (Step 5 Preview) ----
-// reasoning_effort do modelo: "low" | "medium" | "high" (não existe desligado).
-// Os 4 níveis do Tato (o teto de pensamento é aplicado pelo servidor: estourou
-// sem começar a responder → corta e refaz em "low", levando o raciocínio já feito):
-//   none   (oi, conversa curta)               → "low",    teto  2K tokens
-//   low    (rápido, pouca inteligência)        → "low",    teto 10K tokens
-//   medium (pensamento um pouco complexo)      → "medium", teto 20K tokens
-//   max    (projetos grandes, arquitetura...)  → "high",   teto 70K tokens
-// maxOut: limite de saída por nível (pedir 256K num "oi" piora a fila).
+// ---- CONTROLE DE RACIOCÍNIO (Nemotron 3 Ultra) ----
+// enable_thinking liga/desliga e reasoning_budget é um TETO NATIVO de tokens de
+// pensamento (o modelo fecha o raciocínio no limite e responde).
+//   none   (oi, conversa curta)               → sem raciocínio
+//   low    (rápido, pouca inteligência)        → teto 10K
+//   medium (pensamento um pouco complexo)      → teto 20K
+//   max    (projetos grandes, arquitetura...)  → teto 70K
+// maxOut = raciocínio + espaço para a resposta.
 // Variável opcional no Render: THINKING_MODE = auto (padrão) | none | low | medium | max
 const THINKING_MODE = String(process.env.THINKING_MODE || 'auto').toLowerCase();
 const THINK_LEVELS = {
-  none:   { effort: 'low',    budget: Number(process.env.THINK_BUDGET_NONE_TOKENS)   || 2000,  maxOut: 8192 },
-  low:    { effort: 'low',    budget: Number(process.env.THINK_BUDGET_LOW_TOKENS)    || 10000, maxOut: 32768 },
-  medium: { effort: 'medium', budget: Number(process.env.THINK_BUDGET_MEDIUM_TOKENS) || 20000, maxOut: 65536 },
-  max:    { effort: 'high',   budget: Number(process.env.THINK_BUDGET_MAX_TOKENS)    || 70000, maxOut: 0 }
+  none:   { effort: 'off', budget: 0,                                                    maxOut: 8192 },
+  low:    { effort: 'on',  budget: Number(process.env.THINK_BUDGET_LOW_TOKENS)    || 10000, maxOut: 26384 },
+  medium: { effort: 'on',  budget: Number(process.env.THINK_BUDGET_MEDIUM_TOKENS) || 20000, maxOut: 52768 },
+  max:    { effort: 'on',  budget: Number(process.env.THINK_BUDGET_MAX_TOKENS)    || 70000, maxOut: 135536 }
 };
 // Estimativa: ~4 caracteres por token.
 const CHARS_PER_TOKEN = 4;
 
-// Amostragem recomendada pela StepFun para o Step 5 Preview.
+// Amostragem do exemplo oficial do Nemotron 3 Ultra.
 const TEMPERATURE = 1.0;
 const TOP_P = 0.95;
 
@@ -314,8 +317,7 @@ function buildSystemPrompt(lang, imageContext) {
 
   'REGRA DE QUALIDADE: quando o usuário pedir um jogo ou app com "animações bonitas", "personalizado", ' +
   '"bonitinho" ou termos parecidos, isso é uma exigência de qualidade visual real, não decoração. Implemente ' +
-  'de fato: elementos desenhados/animados via canvas ou CSS (nunca referencie imagens externas ou URLs que ' +
-  'você não tem certeza que existem), transições suaves, estados de hover, tela de menu funcional com botões ' +
+  'de fato: use o que for melhor e mais rápido — imagens e URLs externas, SVG, canvas ou CSS —, transições suaves, estados de hover, tela de menu funcional com botões ' +
   'que fazem algo, e a lógica completa do jogo/app (física, colisão, pontuação, game over, reinício), não um ' +
   'esqueleto ou protótipo simplificado. Prefira entregar algo mais completo e caprichado do que o mínimo ' +
   'literal pedido. \n\n' +
@@ -370,22 +372,6 @@ function buildSystemPrompt(lang, imageContext) {
   'write_file num nome, se não tiver certeza se aquele nome já foi usado pra outra coisa, rode "ls" primeiro ' +
   'pra conferir. Se o usuário pedir algo novo e diferente do que já existe, dê um nome novo — não pergunte, apenas ' +
   'escolha um nome claro e siga.\n\n' +
-
-  'VERSIONAMENTO DE NOME EM REESCRITA COMPLETA — REGRA OBRIGATÓRIA: toda vez que você reescrever um arquivo que ' +
-  'já existe inteiro via write_file (casos (b) e (c) da regra 3 — pedido explícito de reescrita ou mudança ' +
-  'estrutural grande), o arquivo resultante NÃO deve ficar com o nome idêntico ao anterior. Em vez disso, ' +
-  'adicione um número sequencial logo antes da extensão, incrementando a cada nova reescrita completa daquele ' +
-  'arquivo: se o nome atual é "jogo.html", a primeira reescrita completa vira "jogo1.html"; se pedirem outra ' +
-  'reescrita completa em cima dessa, vira "jogo2.html"; e assim por diante. Se o nome atual já termina em número ' +
-  '(ex: "jogo3.html"), a próxima reescrita completa incrementa esse número (vira "jogo4.html"), nunca reinicia. ' +
-  'O motivo: cada reescrita completa gera uma entrega separada na conversa, e se duas entregas diferentes tiverem ' +
-  'exatamente o mesmo nome, isso confunde qual delas é a mais recente/correta ao consultar o histórico depois — ' +
-  'com números diferentes fica impossível confundir uma com a outra. IMPORTANTE: essa regra de numerar vale só ' +
-  'pra reescrita COMPLETA via write_file num arquivo que já existia. Edições pontuais via run_command/sed -i ou ' +
-  'edit_file continuam alterando o arquivo original no mesmo nome, sem numerar — não são uma "nova entrega", é o ' +
-  'mesmo arquivo sendo ajustado no lugar. Depois de renomear, ao continuar a conversa, o arquivo "atual" pra ' +
-  'qualquer novo pedido passa a ser o do nome mais recente/mais numerado — confirme sempre com "ls" se tiver ' +
-  'dúvida de qual é a versão mais nova.\n\n' +
 
   'REGRA OBRIGATÓRIA PRA QUANDO A REESCRITA COMPLETA (write_file) FOR A OPÇÃO CERTA NUM ARQUIVO QUE JÁ EXISTE: ' +
   'isso vale nos casos (b) e (c) da regra 3 acima — pedido explícito de reescrita completa, ou mudança grande/' +
@@ -462,46 +448,6 @@ function buildSystemPrompt(lang, imageContext) {
   'é melhor pra dado estruturado direto da fonte. Não anuncie que vai usar a ferramenta nem explique o processo de ' +
   'busca ao usuário; apenas chame e use o resultado naturalmente na resposta.\n\n' +
 
-  'FERRAMENTA screenshot_html — SEUS OLHOS PARA CONFERIR O VISUAL: se esta ferramenta estiver disponível, ela ' +
-  'tira um print REAL de um arquivo .html/.htm do projeto, renderizado de verdade num navegador isolado, e a ' +
-  'imagem chega pra você numa mensagem logo depois do resultado da ferramenta, começando com "TATO_SCREENSHOT:". ' +
-  'Essa mensagem NÃO é do usuário: é o print que você mesmo pediu. Olhe a imagem de verdade e só depois decida ' +
-  'o próximo passo. O resultado em texto também traz um resumo: tamanho da tela e da página, aviso de rolagem ' +
-  'horizontal, elementos que passam da borda direita e o texto visível.\n' +
-  'PARÂMETROS: path (obrigatório, o .html); selector (opcional, seletor CSS da parte que você quer ver, ex: ' +
-  '"#barra-escrever" ou ".cabecalho" — o print mostra só aquele elemento); device ("mobile" = 390x844, padrão, ou ' +
-  '"desktop" = 1280x800); width/height (opcionais, em px, sobrescrevem o device); full_page (true = página inteira ' +
-  'com rolagem, até 4000px de altura).\n' +
-  'QUANDO USAR — de forma PROATIVA, sem o usuário precisar pedir:\n' +
-  '(a) Assim que você terminar qualquer coisa visual (tela, layout, menu, card, botão, barra, formulário, jogo, ' +
-  'landing page), tire um print pra conferir antes de dar a tarefa como concluída.\n' +
-  '(b) Depois de qualquer ajuste visual (alinhamento, cor, tamanho, espaçamento, ícone, algo cortado, sobreposto ou ' +
-  'fora do lugar, responsividade): confirme com um print que ficou como o usuário pediu.\n' +
-  '(c) Quando o usuário relatar um bug visual ("tá cortado", "tá sobrepondo", "ficou torto"): veja o print ANTES de ' +
-  'editar, para achar a causa real em vez de adivinhar pelo código, e tire outro DEPOIS de corrigir.\n' +
-  '(d) NO MEIO DA CONSTRUÇÃO, sem esperar o arquivo ficar completo: em arquivos grandes ou feitos em etapas, monte ' +
-  'o esqueleto ou uma seção, tire print (use selector pra ver só aquela parte) e siga adiante. Basta o arquivo ser ' +
-  'um HTML que carregue. Conferir cada parte enquanto constrói evita descobrir tudo quebrado só no final.\n' +
-  '(e) Se o layout é responsivo ou o usuário usa celular e PC, tire um print de device "mobile" e outro de "desktop".\n' +
-  'COMO USAR BEM: prefira selector pra conferir só a parte que você mexeu (a imagem fica mais nítida); use full_page ' +
-  'só para uma visão geral. Ordem ideal: write_file/edit_file → test_html_sandbox (erros de execução) → ' +
-  'screenshot_html (visual) → corrija o que viu → confirme de novo. Uma ferramenta não substitui a outra.\n' +
-  'COMO ANALISAR O PRINT: procure texto cortado ou ilegível, elementos sobrepostos, alinhamento e espaçamento ' +
-  'errados, contraste ruim, coisas fora da borda da tela e partes que deveriam aparecer e não aparecem. Print ' +
-  'totalmente branco ou vazio costuma indicar erro de JavaScript, seletor errado ou conteúdo que só aparece depois ' +
-  'de uma ação — confira o resumo em texto e rode test_html_sandbox.\n' +
-  'LIMITAÇÕES (não confunda com bug do código): o print é estático e mostra o estado inicial da página logo após ' +
-  'carregar — sem cliques, hover ou teclado, animações congeladas num instante e jogos mostrando só a tela inicial. ' +
-  'Imagens e fontes de URLs externas podem não aparecer. O armazenamento local começa zerado. Por isso, não use o ' +
-  'print para provar que a LÓGICA funciona; para isso use test_html_sandbox e leitura do código.\n' +
-  'DISCIPLINA: não tire prints repetidos sem ter mudado nada entre eles; se após uns 3 ciclos de ajuste o problema ' +
-  'visual persistir, explique ao usuário o que você viu e o que tentou. Não use a ferramenta em tarefas sem parte ' +
-  'visual (backend, scripts, texto puro, Python). Se o resultado vier com FALHOU, leia o motivo (seletor ' +
-  'inexistente? arquivo não salvo?), corrija e tente de novo. Só o print mais recente fica visível pra você; os ' +
-  'antigos viram texto, então, se precisar comparar, anote o que viu. Não narre "vou tirar um print": apenas chame ' +
-  'a ferramenta. Na resposta final, diga em uma ou duas frases o que conferiu e corrigiu. NUNCA diga que viu ou ' +
-  'conferiu o visual sem ter de fato chamado a ferramenta e analisado a imagem.\n\n' +
-
   'IMPORTANTE — NÃO CONFUNDA PEDIDO DE IMAGEM COM PEDIDO DE CÓDIGO: um pedido como "crie uma imagem", "gere uma foto", ' +
   '"faça uma ilustração", "desenhe" ou equivalente, quando a intenção é obter uma imagem visual, é um pedido de imagem, ' +
   'não um pedido para programar uma representação da imagem. Nesses casos, siga EXCLUSIVAMENTE as regras do estado de ' +
@@ -534,13 +480,7 @@ const FILE_REMINDER =
   '(1) Antes de mexer em QUALQUER arquivo que já existe — seja pra editar pontualmente ou reescrever inteiro — ' +
   'rode "ls" e depois "cat"/"grep" pra confirmar o nome exato e o conteúdo REAL do arquivo AGORA, mesmo que você ' +
   'ache que já sabe (sua "lembrança" pode estar desatualizada ou ser de um arquivo diferente com nome parecido). ' +
-  'Nunca edite ou analise um arquivo baseado só no que apareceu antes na conversa sem reconferir. ' +
-  '(2) Se a ação certa for reescrever um arquivo já existente por completo (write_file), o nome do arquivo NOVO ' +
-  'tem que ser diferente do nome atual: adicione um número antes da extensão, incrementando a partir do que já ' +
-  'existir (ex: "jogo.html" existente → escreva "jogo1.html"; se já existir "jogo1.html" → escreva "jogo2.html"). ' +
-  'NUNCA escreva um write_file usando exatamente o mesmo nome que um arquivo que já existe na conversa. ' +
-  '(3) Se a ação for só um ajuste pontual (sed -i/edit_file) no arquivo, aí sim o nome continua o mesmo — não ' +
-  'numera edição pontual, só reescrita completa.';
+  'Nunca edite ou analise um arquivo baseado só no que apareceu antes na conversa sem reconferir.';
 
 
 // ============================================================
@@ -607,10 +547,10 @@ function trimToSafeBoundary(text) {
 
 
 // ============================================================
-// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE) — Step 5 Preview
+// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE) — Nemotron
 // ============================================================
 
-// O Step 5 Preview aceita partes "image_url" no formato OpenAI:
+// Os modelos com visão aceitam partes "image_url" no formato OpenAI:
 //   { type: 'image_url', image_url: { url: 'https://...' } }
 //   { type: 'image_url', image_url: { url: 'data:image/png;base64,...' } }
 // Aceitamos PNG, JPEG e WebP em data URL (Base64) ou link http(s).
@@ -763,6 +703,19 @@ function attachSeparateImages(history, rawImages) {
 // Limita as imagens por requisição (MAX_IMAGES_PER_REQUEST).
 // Mantém as mais RECENTES e troca as antigas por um aviso em texto, pra
 // conversa continuar fazendo sentido.
+// O Nemotron 3 Ultra é só texto: troca as imagens por um aviso para o modelo.
+function stripImagesForTextModel(history) {
+  for (const m of history) {
+    if (!m || !Array.isArray(m.content)) continue;
+    const n = m.content.filter(p => p && p.type === 'image_url').length;
+    if (!n) continue;
+    const text = m.content.filter(p => p && p.type === 'text').map(p => p.text).join('\n');
+    m.content = (text ? text + '\n\n' : '') + '[O usuário anexou ' + n + ' imagem(ns), mas este modelo não consegue ver imagens. ' +
+      'Diga isso com naturalidade se a resposta depender da imagem e peça uma descrição em texto.]';
+  }
+  return history;
+}
+
 function limitHistoryImages(history) {
   let total = 0;
   for (const message of history) {
@@ -806,7 +759,9 @@ function limitHistoryImages(history) {
 // os ~22 mil tokens dele.
 let BUILDER_PROMPT = '';
 try {
-  BUILDER_PROMPT = readFileSync(new URL('./tato-builder-system-prompt.md', import.meta.url), 'utf8').trim();
+  BUILDER_PROMPT = readFileSync(new URL('./tato-builder-system-prompt.md', import.meta.url), 'utf8').trim()
+    // A ferramenta screenshot_html foi removida: descarta qualquer linha que mande usá-la.
+    .split('\n').filter(l => !/screenshot/i.test(l)).join('\n');
   console.log('[Tato 4.1] Modo Construtor carregado:', BUILDER_PROMPT.length, 'caracteres');
 } catch (e) {
   console.warn('[Tato 4.1] tato-builder-system-prompt.md não encontrado — Modo Construtor desligado.');
@@ -827,7 +782,7 @@ function isBuildRequest(history) {
     return m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.some(function (tc) {
       const name = tc && tc.function && tc.function.name;
       const args = tc && tc.function && tc.function.arguments || '';
-      return /^(write_file|edit_file|test_html_sandbox|screenshot_html)$/.test(name || '') && /\.html?\b/i.test(args);
+      return /^(write_file|edit_file|test_html_sandbox)$/.test(name || '') && /\.html?\b/i.test(args);
     });
   });
 }
@@ -1034,9 +989,13 @@ function decideThinking(history, builderMode) {
   return pick('low');
 }
 
-// Parâmetro de raciocínio do Step 5 Preview (vai no topo do corpo da requisição).
-function reasoningParams(effort) {
-  return { reasoning_effort: effort && effort !== 'none' ? effort : 'low' };
+// Parâmetros de raciocínio do Nemotron 3 Ultra. Com ferramentas, a NVIDIA pede
+// force_nonempty_content para separar raciocínio e tool calls corretamente.
+function reasoningParams(decision, hasTools) {
+  if (!decision || decision.effort === 'off') return { chat_template_kwargs: { enable_thinking: false } };
+  const kw = { enable_thinking: true };
+  if (hasTools) kw.force_nonempty_content = true;
+  return { chat_template_kwargs: kw, reasoning_budget: decision.budgetTokens };
 }
 
 function buildThinkingReminder(lang) {
@@ -1093,9 +1052,9 @@ app.post('/', async function (req, res) {
 
   const body = req.body;
 
-  const history = limitHistoryImages(
+  const history = stripImagesForTextModel(limitHistoryImages(
     attachSeparateImages(normalizeHistory(body && body.messages), body && body.images)
-  );
+  ));
 
   if (!history.length) {
     return res.status(400).json({ ok: false, error: 'Nenhuma mensagem enviada.' });
@@ -1124,11 +1083,11 @@ app.post('/', async function (req, res) {
   if (builderMode) console.log('[Tato 4.1] Modo Construtor ATIVO nesta resposta');
 
   const thinkDecision = decideThinking(history, builderMode);
-  // O Step 5 sempre pensa: o teto vale para todos os níveis.
-  const reasoningEnabled = true;
-  const thinkBudgetTokens = thinkDecision.budgetTokens;
+  const reasoningEnabled = thinkDecision.effort !== 'off';
+  // O teto nativo (reasoning_budget) já corta; o do servidor é só uma rede de segurança.
+  const thinkBudgetTokens = Math.ceil(thinkDecision.budgetTokens * 1.25);
   let thinkingCutDone = false;
-  console.log('[Tato 4.1] raciocínio:', thinkDecision.level, '| reasoning_effort:', thinkDecision.effort, '| teto:', thinkBudgetTokens, 'tokens');
+  console.log('[Tato 4.1] raciocínio:', thinkDecision.level, '| pensamento:', thinkDecision.effort, '| teto:', thinkBudgetTokens, 'tokens');
 
   const reminders = [
     FILE_REMINDER,
@@ -1137,9 +1096,8 @@ app.post('/', async function (req, res) {
     buildImageReminder(lang, imageContext, tools),
     buildThinkingReminder(lang),
     builderMode
-      ? 'LEMBRETE DO MODO CONSTRUTOR: siga o system prompt do Modo Construtor. Nenhum arquivo é entregue sem ' +
-        'verificação REAL com Node.js nesta resposta (sintaxe, estrutura, lógica), seguida de test_html_sandbox e ' +
-        'screenshot_html. Sem Node.js rodado e aprovado, não está pronto.'
+      ? 'LEMBRETE DO MODO CONSTRUTOR: siga o system prompt do Modo Construtor. Verificações (Node.js, ' +
+        'test_html_sandbox) são opcionais: use quando ajudarem, sem travar a entrega.'
       : '',
     explicitGithubRequest && hasGithubTool
       ? 'GITHUB TOOL OVERRIDE: o pedido atual do usuário menciona explicitamente GitHub. ' +
@@ -1163,8 +1121,8 @@ app.post('/', async function (req, res) {
     max_tokens: thinkDecision.maxOut || MAX_TOKENS_STANDARD,
     temperature: TEMPERATURE,
     top_p: TOP_P,
-    // Nível de raciocínio do Step 5 Preview (low | medium | high).
-    ...reasoningParams(thinkDecision.effort),
+    // Raciocínio do Nemotron 3 Ultra (liga/desliga + teto nativo).
+    ...reasoningParams(thinkDecision, !!(tools && tools.length)),
     stream: true
   };
 
@@ -1199,6 +1157,7 @@ app.post('/', async function (req, res) {
     if (!next) return false;
     console.warn('[Tato 4.1] max_tokens', payload.max_tokens, 'recusado pela NVIDIA — tentando com', next);
     payload.max_tokens = next;
+    if (payload.reasoning_budget && payload.reasoning_budget >= next) payload.reasoning_budget = Math.max(1024, next - 4096);
     return true;
   }
 
@@ -1396,7 +1355,7 @@ app.post('/', async function (req, res) {
 
           const delta = choice.delta || {};
 
-          // O Step 5 Preview (via NVIDIA) manda o raciocínio em
+          // O Nemotron (via NVIDIA) manda o raciocínio em
           // reasoning_content ou reasoning; aceitamos as variantes.
           const reasoningPiece =
             (typeof delta.reasoning_content === 'string' && delta.reasoning_content) ||
@@ -1484,7 +1443,8 @@ app.post('/', async function (req, res) {
       thinkingCutDone = true;
       flushPending();
       console.warn('[Tato 4.1] Orçamento de raciocínio estourado (~' + Math.ceil(reasoningContentAcc.length / CHARS_PER_TOKEN) + ' de ' + thinkBudgetTokens + ' tokens) — refazendo sem raciocínio.');
-      payload.reasoning_effort = 'low'; // o Step 5 não desliga: refaz no mínimo
+      payload.chat_template_kwargs = { enable_thinking: false }; // refaz sem raciocínio
+      delete payload.reasoning_budget;
       // Vai como mensagem de usuário (o template do modelo só aceita
       // system no começo da conversa).
       // Leva junto o raciocínio já feito: a resposta refeita parte dele, sem pensar de novo.
@@ -1719,7 +1679,7 @@ function parseVerdict(text) {
 async function classifyBanner(imageDataUrl) {
   const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
   const body = {
-    model: MODEL,
+    model: VISION_MODEL,
     messages: [
       { role: 'system', content: CONTATOS_BANNER_PROMPT },
       {
@@ -1733,8 +1693,8 @@ async function classifyBanner(imageDataUrl) {
     max_tokens: 16384, // o raciocínio conta dentro do limite
     temperature: 0.2,
     top_p: 0.95,
-    // Raciocínio "medium": olha a imagem com cuidado sem demorar demais.
-    reasoning_effort: 'medium',
+    // Raciocínio em esforço médio no modelo de visão.
+    chat_template_kwargs: { enable_thinking: true, medium_effort: true },
     stream: false
   };
   let lastErr = null;
@@ -1810,7 +1770,7 @@ async function nvidiaText(system, user, maxTokens, opts) {
     max_tokens: Math.max(8192, maxTokens || 0),
     temperature: 0.7,
     top_p: 0.95,
-    reasoning_effort: opts.effort || 'low',
+    chat_template_kwargs: { enable_thinking: false },
     stream: false
   };
   // Ferramentas só quando quem chama passa explicitamente (ConTATOs: só pesquisa).
