@@ -16,6 +16,8 @@
 
 import express from 'express';
 import { readFileSync } from 'fs';
+import { lookup } from 'dns/promises';
+import net from 'net';
 
 const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
 // ID confirmado na NVIDIA Build: nvidia/nemotron-3.5-super-vl-120b-a12b.
@@ -1945,21 +1947,41 @@ app.post('/contatos-resumo', async function (req, res) {
 });
 
 
+
 // ============================================================
-// START
+// SKILLS — PROXY DE API (ferramenta skill_http do app)
 // ============================================================
+// Uma skill só acessa os domínios que ela mesma declarou (lidos do banco,
+// nunca do pedido). Só https, sem IPs internos, com timeout e limite de tamanho.
+const SKILL_RATE = new Map();
+function skillRateOk(ip) {
+  const now = Date.now();
+  const arr = (SKILL_RATE.get(ip) || []).filter(t => now - t < 60000);
+  if (arr.length >= 60) { SKILL_RATE.set(ip, arr); return false; }
+  arr.push(now); SKILL_RATE.set(ip, arr);
+  if (SKILL_RATE.size > 5000) SKILL_RATE.clear();
+  return true;
+}
+function isPrivateIp(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    return a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+  }
+  const x = ip.toLowerCase();
+  return x === '::1' || x === '::' || x.startsWith('fc') || x.startsWith('fd') || x.startsWith('fe80') ||
+    (x.startsWith('::ffff:') && isPrivateIp(x.slice(7)));
+}
+const SKILL_BLOCKED_HEADERS = /^(host|cookie|connection|content-length|transfer-encoding|x-forwarded-.*|forwarded)$/i;
 
-const PORT = Number(process.env.PORT) || 10000;
-const HOST = '0.0.0.0';
-
-// Render fica na frente do Node com um proxy HTTP.
-// Mantemos conexões longas para o streaming SSE da IA.
-const httpServer = app.listen(PORT, HOST, function () {
-  console.log('Tato server rodando em http://' + HOST + ':' + PORT + ' — modelo ' + MODEL);
-});
-
-// Evita que o próprio Node encerre conexões longas antes do streaming terminar.
-httpServer.keepAliveTimeout = 120000;
-httpServer.headersTimeout = 125000;
-httpServer.requestTimeout = 0;
-httpServer.timeout = 0;
+app.post('/skill-fetch', async function (req, res) {
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  if (!skillRateOk(ip)) return res.status(429).json({ ok: false, error: 'Muitas chamadas de skill em pouco tempo. Espere um minuto.' });
+  const b = req.body || {};
+  const id = String(b.skill_id || '');
+  if (!/^[0-9a-f-]{36}$/i.test(id)) return res.status(400).json({ ok: false, error: 'skill_id inválido' });
+  let target;
+  try { target = new URL(String(b.url || '')); } catch (e) { return res.status(400).json({ ok: false, error: 'URL inválida' }); }
+  if (target.protocol !== 'https:') return res.status(400).json({ ok: false, error: 'Só URLs https:// são permitidas.' });
+  if (target.username || target.password || (target.port && target.port !== '443')) return res.status(400).json({ ok: false, error: 'URL não permitida.' });
+  
