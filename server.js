@@ -9,10 +9,9 @@
 //   NVIDIA_API_KEY = ...
 //   SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY = (verificação de banners do ConTATOs)
 // API OpenAI-compatible da NVIDIA (integrate.api.nvidia.com, endpoint
-// /v1/chat/completions) usando o modelo GLM-5.3-Flash (Z.ai) — contexto
-// de até 1M tokens, saída máxima de 128K, entrada de texto + imagem.
-// O raciocínio do GLM-5.3-Flash fica SEMPRE ligado; o nível é controlado
-// por reasoning_effort ("low" | "high" | "max").
+// /v1/chat/completions) usando o modelo DeepSeek-V4.1-Flash — MoE multimodal
+// (texto + imagem), contexto de até 1M tokens, tool calling e raciocínio
+// controlado por reasoning_effort ("none" | "low" | "high" | "max").
 // Variáveis opcionais no Render: MODEL_ID e NVIDIA_ENDPOINT (para trocar
 // de provedor sem mexer no código).
 // ============================================================
@@ -23,8 +22,8 @@ import { lookup } from 'dns/promises';
 import net from 'net';
 
 const NVIDIA_ENDPOINT = process.env.NVIDIA_ENDPOINT || 'https://integrate.api.nvidia.com/v1/chat/completions';
-// GLM-5.3-Flash na NVIDIA. Se o ID no catálogo for outro, troque pela env MODEL_ID.
-const MODEL = process.env.MODEL_ID || 'z-ai/glm-5.3-flash';
+// DeepSeek-V4.1-Flash na NVIDIA. Se o ID no catálogo for outro, troque pela env MODEL_ID.
+const MODEL = process.env.MODEL_ID || 'deepseek-ai/deepseek-v4.1-flash';
 
 // Rodando no Render (sem limite de CPU time por request), dá pra usar
 // um timeout bem mais folgado do que dava no Cloudflare Free.
@@ -32,25 +31,25 @@ const FETCH_TIMEOUT_MS = 1200000; // 20 minutos (era 5 min — cortava em respos
 const HEARTBEAT_MS = 12000;
 const FLUSH_MS = 60;
 
-// Tato 4.1 agora roda sobre GLM-5.3-Flash (via NVIDIA).
-// Limite de saída: 131.072 tokens (128K), o MÁXIMO do modelo (o raciocínio
-// conta dentro desse limite). Se o endpoint recusar, o servidor tenta de novo
-// sozinho com um limite menor (ver MAX_TOKENS_FALLBACK).
-const MAX_TOKENS_STANDARD = 131072;
-const MAX_TOKENS_FALLBACK = [65536, 32768];
+// Tato 4.1 agora roda sobre DeepSeek-V4.1-Flash (via NVIDIA).
+// Limite de saída: 262.144 tokens (256K) — o raciocínio conta dentro dele.
+// Se o endpoint recusar esse valor, o servidor reduz sozinho o max_tokens
+// (ver MAX_TOKENS_FALLBACK); o modelo continua o mesmo.
+const MAX_TOKENS_STANDARD = Number(process.env.MAX_TOKENS) || 262144;
+const MAX_TOKENS_FALLBACK = [131072, 65536];
 
-// ---- CONTROLE DE RACIOCÍNIO (GLM-5.3-Flash) ----
-// O modelo não desliga o raciocínio e só aceita reasoning_effort low | high | max.
-// Os 4 níveis do Tato são mapeados assim (o teto de pensamento é aplicado pelo
-// servidor: estourou sem começar a responder → corta e refaz direto, em "low"):
-//   none   (oi, conversa curta)               → effort "low",  teto  2K tokens
-//   low    (rápido, pouca inteligência)        → effort "low",  teto 10K tokens
-//   medium (pensamento um pouco complexo)      → effort "high", teto 20K tokens
-//   max    (projetos grandes, arquitetura...)  → effort "max",  teto 70K tokens
+// ---- CONTROLE DE RACIOCÍNIO (DeepSeek-V4.1-Flash) ----
+// reasoning_effort do modelo: "none" (desliga) | "low" | "high" | "max".
+// Os 4 níveis do Tato (o teto de pensamento é aplicado pelo servidor: estourou
+// sem começar a responder → corta e refaz direto, com o raciocínio desligado):
+//   none   (oi, conversa curta)               → "none" (sem pensar)
+//   low    (rápido, pouca inteligência)        → "low",  teto 10K tokens
+//   medium (pensamento um pouco complexo)      → "high", teto 20K tokens
+//   max    (projetos grandes, arquitetura...)  → "max",  teto 70K tokens
 // Variável opcional no Render: THINKING_MODE = auto (padrão) | none | low | medium | max
 const THINKING_MODE = String(process.env.THINKING_MODE || 'auto').toLowerCase();
 const THINK_LEVELS = {
-  none:   { effort: 'low',  budget: Number(process.env.THINK_BUDGET_NONE_TOKENS)   || 2000 },
+  none:   { effort: 'none', budget: 0 },
   low:    { effort: 'low',  budget: Number(process.env.THINK_BUDGET_LOW_TOKENS)    || 10000 },
   medium: { effort: 'high', budget: Number(process.env.THINK_BUDGET_MEDIUM_TOKENS) || 20000 },
   max:    { effort: 'max',  budget: Number(process.env.THINK_BUDGET_MAX_TOKENS)    || 70000 }
@@ -58,7 +57,7 @@ const THINK_LEVELS = {
 // Estimativa: ~4 caracteres por token.
 const CHARS_PER_TOKEN = 4;
 
-// Amostragem recomendada para o GLM-5.3-Flash.
+// Amostragem usada nos testes oficiais do DeepSeek-V4.1-Flash.
 const TEMPERATURE = 1.0;
 const TOP_P = 0.95;
 
@@ -606,10 +605,10 @@ function trimToSafeBoundary(text) {
 
 
 // ============================================================
-// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE) — GLM-5.3-Flash
+// NORMALIZE HISTORY + MULTIMODAL (TEXT/IMAGE) — DeepSeek-V4.1-Flash
 // ============================================================
 
-// O GLM-5.3-Flash aceita partes "image_url" no formato OpenAI:
+// O DeepSeek-V4.1-Flash aceita partes "image_url" no formato OpenAI:
 //   { type: 'image_url', image_url: { url: 'https://...' } }
 //   { type: 'image_url', image_url: { url: 'data:image/png;base64,...' } }
 // Aceitamos PNG, JPEG e WebP em data URL (Base64) ou link http(s).
@@ -655,7 +654,7 @@ function normalizeVisionContent(content) {
   }
 
   // Imagens primeiro, texto depois: é a ordem dos exemplos oficiais de
-  // modelos de visão (GLM-V incluso).
+  // modelos de visão.
   const normalized = images.concat(texts);
   if (!normalized.length) return null;
   // Só texto → manda como string simples (formato mais compatível).
@@ -836,7 +835,7 @@ function isBuildRequest(history) {
 // MONTAGEM DAS MENSAGENS PRO NEMOTRON
 // ============================================================
 
-// O chat template do GLM (como o de vários modelos abertos) só aceita mensagem
+// O chat template de vários modelos abertos só aceita mensagem
 // "system" NO INÍCIO da conversa. Mandar system no meio ou no fim pode
 // dar erro 400 ou fazer o modelo ignorar. Por isso:
 //  - todos os system (prompt principal + system que vierem no histórico)
@@ -916,7 +915,7 @@ function isExplicitGithubRequest(history) {
 // THINK FILTER
 // ============================================================
 
-// O GLM devolve o raciocínio em reasoning_content/reasoning
+// O modelo devolve o raciocínio em reasoning_content/reasoning
 // (separado) ou embutido no content entre <think>...</think>. Este filtro
 // cobre o segundo caso.
 function makeThinkFilter() {
@@ -1033,7 +1032,7 @@ function decideThinking(history, builderMode) {
   return pick('low');
 }
 
-// Parâmetro de raciocínio do GLM-5.3-Flash (vai no topo do corpo da requisição).
+// Parâmetro de raciocínio do DeepSeek-V4.1-Flash (vai no topo do corpo da requisição).
 function reasoningParams(effort) {
   return { reasoning_effort: effort || 'low' };
 }
@@ -1123,8 +1122,7 @@ app.post('/', async function (req, res) {
   if (builderMode) console.log('[Tato 4.1] Modo Construtor ATIVO nesta resposta');
 
   const thinkDecision = decideThinking(history, builderMode);
-  // O GLM sempre pensa: o orçamento vale para todos os níveis.
-  const reasoningEnabled = true;
+  const reasoningEnabled = thinkDecision.effort !== 'none';
   const thinkBudgetTokens = thinkDecision.budgetTokens;
   let thinkingCutDone = false;
   console.log('[Tato 4.1] raciocínio:', thinkDecision.level, '| reasoning_effort:', thinkDecision.effort, '| teto:', thinkBudgetTokens, 'tokens');
@@ -1162,7 +1160,7 @@ app.post('/', async function (req, res) {
     max_tokens: MAX_TOKENS_STANDARD,
     temperature: TEMPERATURE,
     top_p: TOP_P,
-    // Nível de raciocínio do GLM-5.3-Flash (low | high | max).
+    // Nível de raciocínio do DeepSeek-V4.1-Flash (none | low | high | max).
     ...reasoningParams(thinkDecision.effort),
     stream: true
   };
@@ -1391,7 +1389,7 @@ app.post('/', async function (req, res) {
 
           const delta = choice.delta || {};
 
-          // O GLM-5.3-Flash (via NVIDIA/vLLM) manda o raciocínio em
+          // O DeepSeek-V4.1-Flash (via NVIDIA) manda o raciocínio em
           // reasoning_content ou reasoning; aceitamos as variantes.
           const reasoningPiece =
             (typeof delta.reasoning_content === 'string' && delta.reasoning_content) ||
@@ -1479,14 +1477,26 @@ app.post('/', async function (req, res) {
       thinkingCutDone = true;
       flushPending();
       console.warn('[Tato 4.1] Orçamento de raciocínio estourado (~' + Math.ceil(reasoningContentAcc.length / CHARS_PER_TOKEN) + ' de ' + thinkBudgetTokens + ' tokens) — refazendo sem raciocínio.');
-      payload.reasoning_effort = 'low'; // o GLM não desliga o raciocínio: refaz no mínimo
+      payload.reasoning_effort = 'none'; // refaz sem raciocínio
       // Vai como mensagem de usuário (o template do modelo só aceita
       // system no começo da conversa).
+      // Leva junto o raciocínio já feito: a resposta refeita parte dele, sem pensar de novo.
+      // Limite de ~60 mil caracteres (≈15K tokens): mantém o começo (plano) e o fim (conclusões).
+      const MAX_KEEP = 60000;
+      const prevThought = reasoningContentAcc.length > MAX_KEEP
+        ? reasoningContentAcc.slice(0, 15000) + '\n[...trecho do meio omitido...]\n' + reasoningContentAcc.slice(-(MAX_KEEP - 15000))
+        : reasoningContentAcc;
       payload.messages.push({
         role: 'user',
         content: lang === 'en-US'
-          ? '[System instruction] You have already reflected enough. Act now, directly: call the needed tool or write the final answer. Do not deliberate further.'
-          : '[Instrução do sistema] Você já refletiu o suficiente. Aja agora, direto: chame a ferramenta necessária ou escreva a resposta final. Não delibere mais.'
+          ? '[System instruction] You have already reflected enough. Below is the reasoning you already did for the request above. ' +
+            'Treat it as your own plan: keep its decisions and conclusions, do not start over and do not re-deliberate. ' +
+            'Act now, directly: call the needed tool or write the final answer, following this reasoning.\n\n<previous_reasoning>\n' +
+            prevThought + '\n</previous_reasoning>'
+          : '[Instrução do sistema] Você já refletiu o suficiente. Abaixo está o raciocínio que você já fez para o pedido acima. ' +
+            'Trate-o como o seu próprio plano: mantenha as decisões e conclusões dele, não recomece e não delibere de novo. ' +
+            'Aja agora, direto: chame a ferramenta necessária ou escreva a resposta final seguindo esse raciocínio.\n\n<raciocinio_anterior>\n' +
+            prevThought + '\n</raciocinio_anterior>'
       });
       const cutRetry = await requestUpstreamWithRetry();
       if (cutRetry.fatal || !cutRetry.upstream) {
@@ -1788,11 +1798,11 @@ async function nvidiaText(system, user, maxTokens, opts) {
   const body = {
     model: MODEL,
     messages: opts.messages || [{ role: 'system', content: system }, { role: 'user', content: user }],
-    // O GLM sempre pensa e o raciocínio conta no limite: garante folga.
+    // Folga para o raciocínio, que conta dentro do limite.
     max_tokens: Math.max(8192, maxTokens || 0),
     temperature: 0.7,
     top_p: 0.95,
-    reasoning_effort: opts.effort || 'low',
+    reasoning_effort: opts.effort || 'none',
     stream: false
   };
   // Ferramentas só quando quem chama passa explicitamente (ConTATOs: só pesquisa).
