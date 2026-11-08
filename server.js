@@ -977,6 +977,30 @@ function decideThinking(history, builderMode) {
   return pick('low');
 }
 
+// SUPER POWERS — dados da tarefa atual vindos do app (números limitados aqui).
+function parseSuperpowers(v) {
+  if (!v || typeof v !== 'object') return null;
+  const task = parseInt(v.task, 10);
+  if (!(task >= 1 && task <= 6)) return null;
+  const num = function (x, hi) { x = Math.floor(Number(x) || 0); return Math.min(Math.max(x, 0), hi); };
+  return {
+    task: task,
+    title: String(v.title || '').slice(0, 80),
+    min: num(v.min, 50000), max: num(v.max, 50000), used: num(v.used, 200000),
+    note: String(v.note || '').slice(0, 600)
+  };
+}
+
+function buildSuperpowersReminder(sp) {
+  return 'SUPER POWERS (modo max): você está na TAREFA ' + sp.task + '/6' + (sp.title ? ' — ' + sp.title : '') + '. ' +
+    (sp.max
+      ? 'Pensamento desta tarefa: mínimo ' + sp.min + ' tokens, máximo ' + sp.max + ' tokens; já usou ' + sp.used +
+        ' (faltam ' + Math.max(0, sp.min - sp.used) + ' para o mínimo). Pense profundamente; finalizar antes do mínimo faz a tarefa falhar e recomeçar do zero. '
+      : 'Esta tarefa não tem mínimo nem máximo de pensamento: vá até terminar, sem fugir do tema dela. ') +
+    (sp.note ? 'Aviso: ' + sp.note + ' ' : '') +
+    'Faça SÓ o que é desta tarefa e, ao terminar, chame finalize_tarefa com numero ' + sp.task + '. Ferramentas normais podem ser usadas dentro da tarefa.';
+}
+
 // Parâmetro de raciocínio do Muse Glimmer (vai no topo do corpo da requisição).
 function reasoningParams(decision) {
   return { reasoning_effort: (decision && decision.effort) || 'low' };
@@ -1066,7 +1090,17 @@ app.post('/', async function (req, res) {
   const builderMode = !!BUILDER_PROMPT && isBuildRequest(history);
   if (builderMode) console.log('[Tato 4.1] Modo Construtor ATIVO nesta resposta');
 
-  const thinkDecision = decideThinking(history, builderMode);
+  let thinkDecision = decideThinking(history, builderMode);
+
+  // SUPER POWERS: skill ativa = modo max sempre. O teto de pensamento desta
+  // requisição é o máximo da tarefa atual menos o que ela já usou.
+  const sp = parseSuperpowers(body && body.superpowers);
+  if (sp) {
+    const L = THINK_LEVELS.max;
+    const left = sp.max ? Math.max(1500, sp.max - sp.used) : Math.max(L.budget, 70000);
+    thinkDecision = { level: 'max', effort: L.effort, budgetTokens: left, maxOut: L.maxOut };
+    console.log('[Tato 4.1] Super Powers — tarefa', sp.task, '| usados', sp.used, '| teto restante', left);
+  }
   // O Muse Glimmer sempre raciocina um pouco: o teto vale para todos os níveis.
   const reasoningEnabled = true;
   const thinkBudgetTokens = thinkDecision.budgetTokens;
@@ -1079,6 +1113,7 @@ app.post('/', async function (req, res) {
     buildLangReminder(lang),
     buildImageReminder(lang, imageContext, tools),
     buildThinkingReminder(lang),
+    sp ? buildSuperpowersReminder(sp) : '',
     builderMode
       ? 'LEMBRETE DO MODO CONSTRUTOR: siga o system prompt do Modo Construtor. Verificações (Node.js, ' +
         'test_html_sandbox) são opcionais: use quando ajudarem, sem travar a entrega.'
