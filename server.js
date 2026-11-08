@@ -1825,22 +1825,73 @@ async function fetchJsonT(url, options, ms) {
   } catch (e) { return { ok: false, status: 0, data: {} }; } finally { clearTimeout(t); }
 }
 
+// ---- Pesquisa própria do servidor (DuckDuckGo HTML, sem chave) ----
+function htmlToText(html) {
+  return String(html || '')
+    .replace(/<(script|style|noscript|svg|nav|footer|header)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x27;/g, "'")
+    .replace(/\s+/g, ' ').trim();
+}
+async function fetchTextT(url, ms) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms || 12000);
+  try {
+    const r = await fetch(url, { headers: { 'User-Agent': BROWSER_UA, 'Accept': 'text/html,*/*', 'Accept-Language': 'pt-BR,pt;q=0.9' }, signal: ctl.signal });
+    const txt = await r.text();
+    return { ok: r.ok, status: r.status, text: txt };
+  } catch (e) { return { ok: false, status: 0, text: '', error: e && (e.cause && e.cause.code || e.message) }; }
+  finally { clearTimeout(t); }
+}
+async function ddgSearch(q) {
+  const r = await fetchTextT('https://html.duckduckgo.com/html/?kl=br-pt&q=' + encodeURIComponent(q), 12000);
+  if (!r.ok) { console.warn('[pesquisa] DuckDuckGo HTTP', r.status, r.error || ''); return []; }
+  const out = [];
+  // Cada resultado começa no link "result__a"; o trecho (snippet) vem logo depois, no mesmo bloco.
+  const chunks = r.text.split(/(?=<a[^>]+class="result__a")/).slice(1);
+  for (const c of chunks) {
+    if (out.length >= 5) break;
+    const a = c.match(/<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
+    if (!a) continue;
+    let url = a[1].replace(/&amp;/g, '&');
+    const u = url.match(/[?&]uddg=([^&]+)/);
+    if (u) url = decodeURIComponent(u[1]);
+    if (url.startsWith('//')) url = 'https:' + url;
+    if (!/^https?:\/\//.test(url) || /duckduckgo\.com\/y\.js/.test(url)) continue;
+    const sn = c.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|div|td)>/);
+    out.push({ url, title: htmlToText(a[2]), snippet: htmlToText(sn ? sn[1] : '') });
+  }
+  if (!out.length) console.warn('[pesquisa] DuckDuckGo sem resultados (layout mudou ou bloqueio).');
+  return out;
+}
+async function readPage(url) {
+  const r = await fetchTextT(url, 10000);
+  return r.ok ? htmlToText(r.text).slice(0, 2500) : '';
+}
+
 async function contatosWebSearch(query) {
   const q = String(query || '').trim().slice(0, 300);
   if (!q) return 'Erro: pesquisa vazia.';
   let results = [];
+  let source = 'worker';
   for (let i = 0; i < 2 && !results.length; i++) {
     const r = await fetchJsonT(SEARCH_WORKER + '/search', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ q, max: 5 })
     }, 15000);
     results = r.ok && Array.isArray(r.data.results) ? r.data.results.filter(x => x && x.url).slice(0, 5) : [];
-    if (!results.length && i === 0) await new Promise(res => setTimeout(res, 900));
+    if (!results.length) console.warn('[pesquisa] worker falhou (tentativa ' + (i + 1) + '): HTTP', r.status, JSON.stringify(r.data).slice(0, 160));
+    if (!results.length && i === 0) await new Promise(res => setTimeout(res, 700));
   }
+  if (!results.length) { source = 'ddg'; results = await ddgSearch(q); }
   if (!results.length) return 'A pesquisa por "' + q + '" não trouxe resultados. Não invente: diga que não encontrou.';
-  const reads = await Promise.all(results.slice(0, 2).map(x => fetchJsonT(SEARCH_WORKER + '/tool', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: 'web_read', input: { url: x.url, max_chars: 2500 } })
-  }, 12000).then(r => (r.ok && r.data && !r.data.error && r.data.content) ? r.data.content : null)));
+  console.log('[pesquisa] ok via', source, '-', results.length, 'resultados');
+  const reads = await Promise.all(results.slice(0, 2).map(x => source === 'ddg'
+    ? readPage(x.url)
+    : fetchJsonT(SEARCH_WORKER + '/tool', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'web_read', input: { url: x.url, max_chars: 2500 } })
+      }, 12000).then(r => (r.ok && r.data && !r.data.error && r.data.content) ? r.data.content : readPage(x.url))));
   const today = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo', day: 'numeric', month: 'long', year: 'numeric' });
   return 'Resultados ao vivo (hoje é ' + today + '):\n\n' + results.map((x, i) =>
     '[' + (i + 1) + '] ' + String(x.title || x.url) + '\n' + x.url + '\n' + String(reads[i] || x.snippet || '')).join('\n\n');
@@ -1857,7 +1908,7 @@ async function contatosSearchPlan(ask, recent) {
     const j = JSON.parse(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1));
     if (j && j.search && String(j.query || '').trim()) return String(j.query).trim().slice(0, 200);
     if (j && j.search === false && !NEEDS_SEARCH_RE.test(ask)) return null;
-  } catch (e) { /* cai no atalho */ }
+  } catch (e) { console.warn('[contatos-tato] decisão de pesquisa falhou:', e && e.message); }
   if (NEEDS_SEARCH_RE.test(ask)) return ask.replace(/@tato/ig, '').trim().slice(0, 200) || null;
   return null;
 }
@@ -2028,6 +2079,7 @@ app.get('/diag', async function (req, res) {
   await Promise.all([
     probe('pesquisa_com_origin', SEARCH_WORKER + '/search', { method: 'POST', headers: h, body: JSON.stringify({ q: 'cotação dólar hoje', max: 3 }) }),
     probe('pesquisa_sem_origin', SEARCH_WORKER + '/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ q: 'cotação dólar hoje', max: 3 }) }),
+    probe('duckduckgo', 'https://html.duckduckgo.com/html/?q=dolar+hoje', { headers: { 'User-Agent': BROWSER_UA } }),
     probe('open_meteo', 'https://geocoding-api.open-meteo.com/v1/search?name=Recife&count=1', { headers: { 'User-Agent': BROWSER_UA } }),
     probe('frankfurter', 'https://api.frankfurter.app/latest?from=USD&to=BRL', { headers: { 'User-Agent': BROWSER_UA } })
   ]);
