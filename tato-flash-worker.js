@@ -101,6 +101,38 @@ const TATO_CONTATOS_CONTEXT_PROMPT = {
     'excluir contas. Se alguém perguntar como isso funciona, explique com naturalidade.'
 };
 
+// SUPER POWERS — o app manda { task, title, min, max, used, note } quando a
+// skill está ativa. Os números são limitados aqui; o texto vira um lembrete
+// de sistema logo antes da conversa, e o pensamento é ligado à força.
+function parseSuperpowers(v) {
+  if (!v || typeof v !== 'object') return null;
+  const task = parseInt(v.task, 10);
+  if (!(task >= 1 && task <= 6)) return null;
+  const num = function (x, hi) { x = Math.floor(Number(x) || 0); return Math.min(Math.max(x, 0), hi); };
+  return {
+    task: task,
+    title: String(v.title || '').slice(0, 80),
+    min: num(v.min, 50000), max: num(v.max, 50000), used: num(v.used, 200000),
+    note: String(v.note || '').slice(0, 600)
+  };
+}
+
+function buildSuperpowersPrompt(sp) {
+  return {
+    role: 'system',
+    content:
+      'SUPER POWERS: você está na TAREFA ' + sp.task + '/6' + (sp.title ? ' — ' + sp.title : '') + '. ' +
+      (sp.max
+        ? 'Pense em profundidade antes de agir: mínimo ' + sp.min + ' tokens de pensamento, máximo ' + sp.max +
+          ' (já usou ' + sp.used + ', faltam ' + Math.max(0, sp.min - sp.used) + ' para o mínimo). Finalizar antes do mínimo faz a tarefa falhar e recomeçar. '
+        : 'Esta tarefa não tem mínimo nem máximo de pensamento: vá até terminar, sem fugir do tema dela. ') +
+      (sp.note ? 'Aviso: ' + sp.note + ' ' : '') +
+      'Faça SÓ o que é desta tarefa e, ao terminar, chame a ferramenta finalize_tarefa com numero ' + sp.task +
+      (sp.task === 1 ? ' e o tipo do pedido (codigo, texto, pesquisa ou outro)' : '') +
+      '. As ferramentas normais podem ser usadas dentro da tarefa.'
+  };
+}
+
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'tato-flash-worker', model: AGNES_MODEL });
 });
@@ -115,11 +147,15 @@ app.post('/', async (req, res) => {
       return res.status(500).json({ ok: false, error: 'Servidor sem chave configurada.' });
     }
 
-    const { messages, prompt, tools, tool_choice, chat_template_kwargs } = req.body || {};
+    const { messages, prompt, tools, tool_choice, chat_template_kwargs, superpowers } = req.body || {};
     const baseMessages = Array.isArray(messages)
       ? messages
       : [{ role: 'user', content: String(prompt || '') }];
-    const chatMessages = [TATO_IDENTITY_PROMPT, TATO_TOOL_POLICY_PROMPT, TATO_MODELS_CONTEXT_PROMPT, TATO_CONTATOS_CONTEXT_PROMPT].concat(baseMessages);
+    const sp = parseSuperpowers(superpowers);
+    if (sp) console.log('[tato-flash-worker] Super Powers — tarefa', sp.task, '| usados', sp.used);
+    const chatMessages = [TATO_IDENTITY_PROMPT, TATO_TOOL_POLICY_PROMPT, TATO_MODELS_CONTEXT_PROMPT, TATO_CONTATOS_CONTEXT_PROMPT]
+      .concat(sp ? [buildSuperpowersPrompt(sp)] : [])
+      .concat(baseMessages);
 
     // O Tato manda `tools` (schema padrão OpenAI: {type:'function', function:{...}})
     // sempre que o Code Assist está ativo — a Agnes é compatível com esse
@@ -134,7 +170,9 @@ app.post('/', async (req, res) => {
     // Thinking mode do botão de cérebro no composer: a Agnes 2.5/2.6 Flash
     // liga isso via chat_template_kwargs.enable_thinking (formato oficial
     // dela — não é o campo "thinking" do padrão Anthropic).
-    if (chat_template_kwargs && chat_template_kwargs.enable_thinking) {
+    // Com o Super Powers ativo o pensamento é SEMPRE ligado (as tarefas contam
+    // tokens de pensamento; sem ele toda tarefa falharia no mínimo).
+    if (sp || (chat_template_kwargs && chat_template_kwargs.enable_thinking)) {
       upstreamBody.chat_template_kwargs = { enable_thinking: true };
     }
 
